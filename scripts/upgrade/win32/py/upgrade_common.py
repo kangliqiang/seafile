@@ -3,6 +3,8 @@
 import os
 import sys
 import sqlite3
+import subprocess
+import ccnet
 
 # Directory layout:
 #
@@ -24,13 +26,6 @@ import sqlite3
 #         - upgrade_1.7_1.8.py
 #         - upgrade_1.8_1.9.py
 
-__all__ = [
-    'seafserv_dir',
-    'ccnet_dir',
-    'seafile_dir',
-    'upgrade_db',
-]
-
 pyscript_dir = os.path.dirname(os.path.abspath(__file__))
 upgrade_dir = os.path.dirname(pyscript_dir)
 sql_dir = os.path.join(upgrade_dir, 'sql')
@@ -40,6 +35,29 @@ program_top_dir = os.path.dirname(install_path)
 seafserv_dir = ''
 ccnet_dir = ''
 seafile_dir = ''
+
+def run_argv(argv, cwd=None, env=None, suppress_stdout=False, suppress_stderr=False):
+    '''Run a program and wait it to finish, and return its exit code. The
+    standard output of this program is supressed.
+
+    '''
+    with open(os.devnull, 'w') as devnull:
+        if suppress_stdout:
+            stdout = devnull
+        else:
+            stdout = sys.stdout
+
+        if suppress_stderr:
+            stderr = devnull
+        else:
+            stderr = sys.stderr
+
+        proc = subprocess.Popen(argv,
+                                cwd=cwd,
+                                stdout=stdout,
+                                stderr=stderr,
+                                env=env)
+        return proc.wait()
 
 def error(message):
     print message
@@ -70,6 +88,7 @@ def apply_sqls(db_path, sql_path):
                 conn.execute(line)
 
 def upgrade_db(version):
+    ensure_server_not_running()
     print 'upgrading databases ...'
     ccnet_db = os.path.join(ccnet_dir, 'ccnet.db')
     seafile_db = os.path.join(seafile_dir, 'seafile.db')
@@ -94,5 +113,15 @@ def upgrade_db(version):
     if os.path.exists(seahub_sql):
         print '    upgrading seahub databases ...'
         apply_sqls(seahub_db, seahub_sql)
+
+def ensure_server_not_running():
+    client = ccnet.SyncClient(ccnet_dir)
+    try:
+        client.connect_daemon()
+    except ccnet.NetworkError:
+        pass
+    else:
+        raise Exception('Seafile server is running! You must turn it off before gc!')
+
 
 read_seafserv_dir()

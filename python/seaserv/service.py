@@ -89,6 +89,8 @@ else:
     CCNET_SERVER_PORT = None
     SERVICE_URL = None
 
+SERVER_ID = config.get('General', 'ID')
+
 '''seafile'''
 try:
     SEAFILE_CONF_DIR = os.environ[ENVIRONMENT_VARIABLES[1]]
@@ -102,35 +104,38 @@ else:
 SEAFILE_CONF_DIR = os.path.normpath(os.path.expanduser(SEAFILE_CONF_DIR))
 config.read(os.path.join(SEAFILE_CONF_DIR, 'seafile.conf'))
 
-MAX_UPLOAD_FILE_SIZE = 100 * (2 ** 20) # Default max upload size, set in httpserver.c
-if config.has_option('httpserver', 'max_upload_size'):
-    try:
-        max_upload_size_mb = config.getint('httpserver', 'max_upload_size')
-        if max_upload_size_mb > 0:
-            MAX_UPLOAD_FILE_SIZE = max_upload_size_mb * (2 ** 20)
-    except ValueError:
-        pass
+def get_fileserver_option(key, default):
+    '''
+    "fileserver" used to be "httpserver"
+    '''
+    for section in ('fileserver', 'httpserver'):
+        if config.has_option(section, key):
+            return config.get(section, key)
+
+    return default
+
+MAX_UPLOAD_FILE_SIZE = None # Defaults to no limit
+try:
+    max_upload_size_mb = int(get_fileserver_option('max_upload_size', 0))
+    if max_upload_size_mb > 0:
+        MAX_UPLOAD_FILE_SIZE = max_upload_size_mb * (2 ** 20)
+except ValueError:
+    pass
 
 MAX_DOWNLOAD_DIR_SIZE = 100 * (2 ** 20) # Default max size of a downloadable dir
-if config.has_option('httpserver', 'max_download_dir_size'):
-    try:
-        max_download_dir_size_mb = config.getint('httpserver', 'max_download_dir_size')
-        if max_download_dir_size_mb > 0:
-            MAX_DOWNLOAD_DIR_SIZE = max_download_dir_size_mb * (2 ** 20)
-    except ValueError:
-        pass
+try:
+    max_download_dir_size_mb = int(get_fileserver_option('max_download_dir_size', 0))
+    if max_download_dir_size_mb > 0:
+        MAX_DOWNLOAD_DIR_SIZE = max_download_dir_size_mb * (2 ** 20)
+except ValueError:
+    pass
 
-HTTP_SERVER_PORT = config.get('httpserver', 'port') if \
-        config.has_option('httpserver', 'port') else '8082'
-HTTP_SERVER_HTTPS = config.getboolean('httpserver', 'https') if \
-        config.has_option('httpserver', 'https') else False
+FILE_SERVER_PORT = get_fileserver_option('port', '8082')
 
 if CCNET_SERVER_ADDR:
-    http_or_https = 'https://' if HTTP_SERVER_HTTPS else 'http://'
-    
-    HTTP_SERVER_ROOT = http_or_https + CCNET_SERVER_ADDR + ':' + HTTP_SERVER_PORT
+    FILE_SERVER_ROOT = 'http://' + CCNET_SERVER_ADDR + ':' + FILE_SERVER_PORT
 else:
-    HTTP_SERVER_ROOT = None
+    FILE_SERVER_ROOT = None
 
 CALC_SHARE_USAGE = False
 if config.has_option('quota', 'calc_share_usage'):
@@ -505,10 +510,10 @@ def get_org_repo_owner(repo_id):
     return owner
 
 # commit
-def get_commit(cmt_id):
+def get_commit(repo_id, repo_version, cmt_id):
     """ Get a commit. """
     try:
-        ret = seafserv_threaded_rpc.get_commit(cmt_id)
+        ret = seafserv_threaded_rpc.get_commit(repo_id, repo_version, cmt_id)
     except SearpcError:
         ret = None
     return ret
@@ -793,9 +798,9 @@ def list_org_shared_repos(org_id, user, user_type, start, limit):
     return share_repos
 
 # dir
-def list_dir_by_path(commit_id, path):
+def list_dir_by_path(repo_id, commit_id, path):
     try:
-        ret = seafserv_threaded_rpc.list_dir_by_path(commit_id, path)
+        ret = seafserv_threaded_rpc.list_dir_by_path(repo_id, commit_id, path)
     except SearpcError:
         ret = None
     return ret
@@ -837,9 +842,9 @@ def is_valid_filename(file_or_dir):
 
     return ret
 
-def get_file_size(file_id):
+def get_file_size(store_id, version, file_id):
     try:
-        fs = seafserv_threaded_rpc.get_file_size(file_id)
+        fs = seafserv_threaded_rpc.get_file_size(store_id, version, file_id)
     except SearpcError, e:
         fs = 0
     return fs

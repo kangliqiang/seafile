@@ -3,6 +3,13 @@
 #include <event2/event.h>
 #include <event2/listener.h>
 
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#include <event2/bufferevent.h>
+#include <event2/buffer_compat.h>
+#include <event2/bufferevent_struct.h>
+#endif
+
+
 #include "seafile-session.h"
 #include "utils.h"
 #include "net.h"
@@ -52,7 +59,7 @@ get_listen_port (SeafileSession *session)
         port = atoi(port_str);
     }
 
-    if (port < 1024 || port > 65535)
+    if (port <= 0 || port > 65535)
         port = DEFAULT_SERVER_PORT;
 
     g_free(port_str);

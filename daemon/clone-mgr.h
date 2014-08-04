@@ -14,6 +14,7 @@ typedef struct _SeafCloneManager SeafCloneManager;
 enum {
     CLONE_STATE_INIT,
     CLONE_STATE_CONNECT,
+    CLONE_STATE_CHECK_PROTOCOL,
     CLONE_STATE_INDEX,
     CLONE_STATE_FETCH,
     CLONE_STATE_CHECKOUT,
@@ -42,6 +43,7 @@ struct _CloneTask {
     int                  state;
     int                  error;
     char                 repo_id[37];
+    int                  repo_version;
     char                 peer_id[41];
     char                *peer_addr;
     char                *peer_port; 
@@ -54,6 +56,8 @@ struct _CloneTask {
     int                  enc_version;
     char                *random_key;
     char                 root_id[41];
+
+    gboolean             server_side_merge;
 };
 
 const char *
@@ -86,6 +90,7 @@ seaf_clone_manager_gen_default_worktree (SeafCloneManager *mgr,
 char *
 seaf_clone_manager_add_task (SeafCloneManager *mgr, 
                              const char *repo_id,
+                             int repo_version,
                              const char *peer_id,
                              const char *repo_name,
                              const char *token,
@@ -107,6 +112,7 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
 char *
 seaf_clone_manager_add_download_task (SeafCloneManager *mgr, 
                                       const char *repo_id,
+                                      int repo_version,
                                       const char *peer_id,
                                       const char *repo_name,
                                       const char *token,
@@ -134,5 +140,8 @@ seaf_clone_manager_get_task (SeafCloneManager *mgr,
 
 GList *
 seaf_clone_manager_get_tasks (SeafCloneManager *mgr);
+
+gboolean
+seaf_clone_manager_check_worktree_path (SeafCloneManager *mgr, const char *path, GError **error);
 
 #endif

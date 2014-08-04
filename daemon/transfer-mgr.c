@@ -27,29 +27,28 @@
 #include "sync-mgr.h"
 #include "clone-mgr.h"
 #include "vc-utils.h"
-#include "gc.h"
 #include "mq-mgr.h"
 #include "seafile-config.h"
 
 #include "processors/check-tx-v2-proc.h"
 #include "processors/check-tx-v3-proc.h"
-#include "processors/getcommit-proc.h"
-#include "processors/sendcommit-proc.h"
 #include "processors/sendfs-proc.h"
 #include "processors/getfs-proc.h"
-#include "processors/getblock-proc.h"
-#include "processors/getblock-v2-proc.h"
-#include "processors/sendblock-proc.h"
-#include "processors/sendblock-v2-proc.h"
 #include "processors/getcs-proc.h"
 #include "processors/sendbranch-proc.h"
 #include "processors/getcommit-v2-proc.h"
-#include "processors/sendcommit-v2-proc.h"
+#include "processors/getcommit-v3-proc.h"
 #include "processors/sendcommit-v3-proc.h"
+#include "processors/sendcommit-v3-new-proc.h"
 #include "processors/checkbl-proc.h"
 #include "processors/getcs-v2-proc.h"
+#include "processors/sendcommit-v4-proc.h"
+#include "processors/sendfs-v2-proc.h"
+#include "processors/getfs-v2-proc.h"
 
 #include "block-tx-client.h"
+
+#include "diff-simple.h"
 
 #define TRANSFER_DB "transfer.db"
 
@@ -59,7 +58,6 @@
 #define DEFAULT_BLOCK_SIZE  (1 << 20)
 
 static int schedule_task_pulse (void *vmanager);
-static void free_task_resources (TransferTask *task);
 static void state_machine_tick (TransferTask *task);
 static void
 transition_state (TransferTask *task, int state, int rt_state);
@@ -158,6 +156,7 @@ static const char *transfer_task_error_strs[] = {
     "Failed to start block transfer client.",
     "Failed to upload blocks.",
     "Failed to download blocks.",
+    "Server version is too old."
 };
 
 const char *
@@ -254,7 +253,7 @@ seaf_transfer_task_free (TransferTask *task)
 
     g_hash_table_destroy (task->processors);
 
-    if (task->block_ids) {
+    if (task->protocol_version < 7 && task->block_ids) {
         g_queue_foreach (task->block_ids, free_block_id, NULL);
         g_queue_free (task->block_ids);
     }
@@ -281,6 +280,9 @@ transfer_task_get_done_blocks (TransferTask *task)
     if (task->runtime_state != TASK_RT_STATE_DATA)
         return 0;
 
+    if (task->protocol_version >= 7 && task->type == TASK_TYPE_DOWNLOAD)
+        return task->n_downloaded;
+
     if (task->protocol_version >= 4) {
         int n_left = g_queue_get_length (task->block_ids);
         return task->block_list->n_blocks - n_left;
@@ -290,256 +292,6 @@ transfer_task_get_done_blocks (TransferTask *task)
         return task->n_uploaded;
     else
         return task->block_list->n_valid_blocks;
-}
-
-static BlockList *
-load_blocklist_with_local_history (TransferTask *task)
-{
-    BlockList *bl1, *bl2, *bl = NULL;
-    int i;
-    ObjectList *commits = task->commits;
-    char *commit_id;
-    SeafCommit *commit;
-    GList *parents = NULL;
-
-    /* Upload the blocks pointed by new commits, excluding
-     * blocks that have been uploaded before.
-     */
-
-    bl1 = block_list_new ();
-
-    for (i = 0; i < commits->obj_ids->len; ++i) {
-        commit_id = g_ptr_array_index (commits->obj_ids, i);
-        commit = seaf_commit_manager_get_commit (seaf->commit_mgr, commit_id);
-        if (!commit) {
-            seaf_warning ("Failed to get commit %s.\n", commit_id);
-            block_list_free (bl1);
-            return NULL;
-        }
-
-        if (seaf_fs_manager_populate_blocklist (seaf->fs_mgr,
-                                                commit->root_id,
-                                                bl1) < 0) {
-            seaf_commit_unref (commit);
-            block_list_free (bl1);
-            return NULL;
-        }
-
-        if (commit->parent_id && !object_list_exists (commits, commit->parent_id))
-            parents = g_list_prepend (parents, g_strdup(commit->parent_id));
-
-        if (commit->second_parent_id &&
-            !object_list_exists (commits, commit->second_parent_id))
-            parents = g_list_prepend (parents, g_strdup(commit->second_parent_id));
-
-        seaf_commit_unref (commit);
-    }
-
-    GList *p;
-    char *parent_id;
-    SeafCommit *parent;
-
-    for (p = parents; p; p = p->next) {
-        parent_id = p->data;
-        parent = seaf_commit_manager_get_commit (seaf->commit_mgr,
-                                                 parent_id);
-        if (!parent) {
-            block_list_free (bl1);
-            return NULL;
-        }
-
-        bl2 = block_list_new ();
-        if (seaf_fs_manager_populate_blocklist (seaf->fs_mgr, 
-                                                parent->root_id, bl2) < 0) {
-            seaf_commit_unref (parent);
-            block_list_free (bl1);
-            block_list_free (bl2);
-            return NULL;
-        }
-
-        bl = block_list_difference (bl1, bl2);
-        block_list_free (bl1);
-        bl1 = bl;
-
-        seaf_commit_unref (parent);
-        block_list_free (bl2);
-    }
-
-    seaf_debug ("Uploading %u blocks.\n", bl1->n_blocks);
-
-    return bl1;
-}
-
-static int
-seaf_transfer_task_load_blocklist (TransferTask *task)
-{
-    SeafRepo *repo;
-    BlockList *bl;
-
-    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, task->repo_id);
-    if (!repo && !task->is_clone)
-        return -1;
-
-    if (task->type == TASK_TYPE_UPLOAD) {
-        bl = load_blocklist_with_local_history (task);
-        if (!bl) {
-            seaf_warning ("[tr-mgr]Failed to populate blocklist.\n");
-            return -1;
-        }
-    } else {
-        SeafCommit *remote;
-
-        remote = seaf_commit_manager_get_commit (seaf->commit_mgr,
-                                                 task->head);
-        if (!remote) {
-            seaf_warning ("[tr-mgr] Failed to find commit %s.\n", task->head);
-            return -1;
-        }
-
-        if (!task->is_clone) {
-            /* If we're merging, only get new blocks that need to be checked out.
-             */
-            if (merge_get_new_block_list (repo, remote, &bl) < 0) {
-                seaf_warning ("[tr-mgr] Failed to get new blocks for merge.\n");
-                seaf_commit_unref (remote);
-                return -1;
-            }
-        } else {
-            /* If we're cloning, only get blocks pointed by the lastest commit.
-             */
-            bl = block_list_new ();
-            if (seaf_fs_manager_populate_blocklist (seaf->fs_mgr,
-                                                    remote->root_id,
-                                                    bl) < 0) {
-                seaf_warning ("[tr-mgr] Failed to get blocks of commit %s.\n",
-                           remote->commit_id);
-                seaf_commit_unref (remote);
-                return -1;
-            }
-        }
-        seaf_commit_unref (remote);
-
-        g_return_val_if_fail (bl != NULL, -1);
-    }
-
-    block_list_generate_bitmap (bl);
-
-    task->block_list = bl;
-
-    if (task->protocol_version <= 3) {
-        BitfieldConstruct (&task->active, bl->n_blocks);
-
-        if (task->type == TASK_TYPE_UPLOAD)
-            BitfieldConstruct (&task->uploaded, bl->n_blocks);
-    }
-
-    return 0;
-}
-
-/*
- * Loading block list may take a lot of disk I/O, so do it in a thread.
- */
-
-typedef void (*LoadBLCB) (TransferTask *); 
-
-typedef struct LoadBLData {
-    TransferTask *task;
-    gboolean success;
-    LoadBLCB callback;
-} LoadBLData;
-
-static void
-load_block_list_done (void *vdata)
-{
-    LoadBLData *data = vdata;
-    TransferTask *task = data->task;
-
-    if (task->state == TASK_STATE_CANCELED) {
-        transition_state (task, task->state, TASK_RT_STATE_FINISHED);
-        g_free (data);
-        return;
-    }
-
-    if (data->success)
-        data->callback (task);
-    else
-        transition_state_to_error (task, TASK_ERR_LOAD_BLOCK_LIST);
-
-    g_free (data);
-}
-
-static void *
-load_block_list_thread (void *vdata)
-{
-    LoadBLData *data = vdata;
-
-    if (seaf_transfer_task_load_blocklist (data->task) < 0)
-        data->success = FALSE;
-    else
-        data->success = TRUE;
-
-    return data;
-}
-
-static int
-start_load_block_list_thread (TransferTask *task, LoadBLCB callback)
-{
-    LoadBLData *data = g_new0 (LoadBLData, 1);
-    data->task = task;
-    data->callback = callback;
-
-    return ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                           load_block_list_thread,
-                                           load_block_list_done,
-                                           data);
-}
-
-static int remove_task_state (TransferTask *task)
-{
-    char sql[256];
-
-    snprintf (sql, 256, "DELETE FROM CloneHeads WHERE repo_id = '%s';",
-              task->repo_id);
-    if (sqlite_query_exec (task->manager->db, sql) < 0)
-        return -1;
-
-    return 0;
-}
-
-static void
-save_clone_head (TransferTask *task, const char *head_id)
-{
-    char sql[256];
-
-    snprintf (sql, sizeof(sql), "REPLACE INTO CloneHeads VALUES ('%s', '%s');",
-              task->repo_id, head_id);
-    sqlite_query_exec (task->manager->db, sql);
-}
-
-static gboolean
-get_heads (sqlite3_stmt *stmt, void *vheads)
-{
-    GList **pheads = vheads;
-    const char *head_id;
-
-    head_id = (const char *)sqlite3_column_text (stmt, 0);
-    *pheads = g_list_prepend (*pheads, g_strdup(head_id));
-
-    return TRUE;
-}
-
-GList *
-seaf_transfer_manager_get_clone_heads (SeafTransferManager *mgr)
-{
-    GList *heads = NULL;
-
-    char *sql = "SELECT head FROM CloneHeads";
-    if (sqlite_foreach_selected_row (mgr->db, sql, get_heads, &heads) < 0) {
-        string_list_free (heads);
-        return NULL;
-    }
-
-    return heads;
 }
 
 static void
@@ -564,7 +316,14 @@ transition_state (TransferTask *task, int state, int rt_state)
     task->last_runtime_state = task->runtime_state;
 
     if (rt_state == TASK_RT_STATE_FINISHED) {
-        remove_task_state (task);
+        /* Clear download head info. */
+        if (task->protocol_version >= 7 && task->type == TASK_TYPE_DOWNLOAD &&
+            state == TASK_STATE_FINISHED)
+            seaf_repo_manager_set_repo_property (seaf->repo_mgr,
+                                                 task->repo_id,
+                                                 REPO_PROP_DOWNLOAD_HEAD,
+                                                 EMPTY_SHA1);
+
         task->state = state;
         task->runtime_state = rt_state;
 
@@ -592,8 +351,6 @@ transition_state_to_error (TransferTask *task, int task_errno)
                   task_error_str(task_errno));
 
     task->last_runtime_state = task->runtime_state;
-
-    remove_task_state (task);
 
     task->state = TASK_STATE_ERROR;
     task->runtime_state = TASK_RT_STATE_FINISHED;
@@ -713,30 +470,6 @@ static void register_processors (CcnetClient *client)
                                            SEAFILE_TYPE_CHECK_TX_V3_PROC);
 
     ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-getcommit",
-                                           SEAFILE_TYPE_GETCOMMIT_PROC);
-
-    ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-sendcommit",
-                                           SEAFILE_TYPE_SENDCOMMIT_PROC);
-
-    ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-getblock",
-                                           SEAFILE_TYPE_GETBLOCK_PROC);
-
-    ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-getblock-v2",
-                                           SEAFILE_TYPE_GETBLOCK_V2_PROC);
-
-    ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-sendblock",
-                                           SEAFILE_TYPE_SENDBLOCK_PROC);
-
-    ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-sendblock-v2",
-                                           SEAFILE_TYPE_SENDBLOCK_V2_PROC);
-
-    ccnet_proc_factory_register_processor (client->proc_factory,
                                            "seafile-sendfs",
                                            SEAFILE_TYPE_SENDFS_PROC);
 
@@ -757,17 +490,33 @@ static void register_processors (CcnetClient *client)
                                            SEAFILE_TYPE_GETCOMMIT_V2_PROC);
 
     ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-sendcommit-v2",
-                                           SEAFILE_TYPE_SENDCOMMIT_V2_PROC);
+                                           "seafile-getcommit-v3",
+                                           SEAFILE_TYPE_GETCOMMIT_V3_PROC);
+
     ccnet_proc_factory_register_processor (client->proc_factory,
                                            "seafile-sendcommit-v3",
                                            SEAFILE_TYPE_SENDCOMMIT_V3_PROC);
+
+    ccnet_proc_factory_register_processor (client->proc_factory,
+                                           "seafile-sendcommit-v3-new",
+                                           SEAFILE_TYPE_SENDCOMMIT_V3_NEW_PROC);
+
     ccnet_proc_factory_register_processor (client->proc_factory,
                                            "seafile-checkbl",
                                            SEAFILE_TYPE_CHECKBL_PROC);
     ccnet_proc_factory_register_processor (client->proc_factory,
                                            "seafile-getcs-v2",
                                            SEAFILE_TYPE_GETCS_V2_PROC);
+
+    ccnet_proc_factory_register_processor (client->proc_factory,
+                                           "seafile-sendcommit-v4",
+                                           SEAFILE_TYPE_SENDCOMMIT_V4_PROC);
+    ccnet_proc_factory_register_processor (client->proc_factory,
+                                           "seafile-sendfs-v2",
+                                           SEAFILE_TYPE_SENDFS_V2_PROC);
+    ccnet_proc_factory_register_processor (client->proc_factory,
+                                           "seafile-getfs-v2",
+                                           SEAFILE_TYPE_GETFS_V2_PROC);
 }
 
 int
@@ -845,10 +594,14 @@ clean_tasks_for_repo (SeafTransferManager *manager,
 char *
 seaf_transfer_manager_add_download (SeafTransferManager *manager,
                                     const char *repo_id,
+                                    int repo_version,
                                     const char *peer_id,
                                     const char *from_branch,
                                     const char *to_branch,
                                     const char *token,
+                                    gboolean server_side_merge,
+                                    const char *passwd,
+                                    const char *worktree,
                                     GError **error)
 {
     TransferTask *task;
@@ -868,10 +621,18 @@ seaf_transfer_manager_add_download (SeafTransferManager *manager,
                                    from_branch, to_branch, token,
                                    TASK_TYPE_DOWNLOAD);
     task->state = TASK_STATE_NORMAL;
+    task->repo_version = repo_version;
+
+    task->server_side_merge = server_side_merge;
 
     /* Mark task "clone" if it's a new repo. */
     if (!seaf_repo_manager_repo_exists (seaf->repo_mgr, repo_id))
         task->is_clone = TRUE;
+
+    if (task->is_clone) {
+        task->passwd = g_strdup(passwd);
+        task->worktree = g_strdup(worktree);
+    }
 
     g_hash_table_insert (manager->download_tasks,
                          g_strdup(task->tx_id),
@@ -883,16 +644,25 @@ seaf_transfer_manager_add_download (SeafTransferManager *manager,
 char *
 seaf_transfer_manager_add_upload (SeafTransferManager *manager,
                                   const char *repo_id,
+                                  int repo_version,
                                   const char *peer_id,
                                   const char *from_branch,
                                   const char *to_branch,
                                   const char *token,
+                                  gboolean server_side_merge,
                                   GError **error)
 {
     TransferTask *task;
+    SeafRepo *repo;
 
     if (!repo_id || !from_branch || !to_branch || !token) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Empty argument(s)");
+        return NULL;
+    }
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+    if (!repo) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Repo not found");
         return NULL;
     }
 
@@ -906,6 +676,8 @@ seaf_transfer_manager_add_upload (SeafTransferManager *manager,
                                    from_branch, to_branch, token,
                                    TASK_TYPE_UPLOAD);
     task->state = TASK_STATE_NORMAL;
+    task->repo_version = repo_version;
+    task->server_side_merge = server_side_merge;
 
     g_hash_table_insert (manager->upload_tasks,
                          g_strdup(task->tx_id),
@@ -979,7 +751,8 @@ seaf_transfer_manager_remove_task (SeafTransferManager *manager,
 static void
 cancel_task (TransferTask *task)
 {
-    if (task->runtime_state == TASK_RT_STATE_NETDOWN) {
+    if (task->runtime_state == TASK_RT_STATE_NETDOWN ||
+        task->runtime_state == TASK_RT_STATE_INIT) {
         transition_state (task, TASK_STATE_CANCELED, TASK_RT_STATE_FINISHED);
     } else {
         /*
@@ -988,7 +761,7 @@ cancel_task (TransferTask *task)
          */
         if (task->protocol_version >= 4 &&
             task->runtime_state == TASK_RT_STATE_DATA)
-            block_tx_client_cancel (task->tx_info);
+            block_tx_client_run_command (task->tx_info, BLOCK_CLIENT_CMD_CANCEL);
         transition_state (task, TASK_STATE_CANCELED, task->runtime_state);
     }
 }
@@ -1029,112 +802,417 @@ seaf_transfer_manager_get_download_tasks (SeafTransferManager *manager)
     return g_hash_table_get_values (manager->download_tasks);
 }
 
-
-static int
-start_getcs_proc (TransferTask *task, const char *peer_id)
+int
+seaf_transfer_manager_download_file_blocks (SeafTransferManager *manager,
+                                            TransferTask *task,
+                                            const char *file_id)
 {
-    CcnetProcessor *processor;
+    Seafile *file;
 
-    processor = ccnet_proc_factory_create_remote_master_processor (
-        seaf->session->proc_factory, "seafile-getcs", peer_id);
-    if (!processor) {
-        seaf_warning ("failed to create get chunk server proc.\n");
+    file = seaf_fs_manager_get_seafile (seaf->fs_mgr,
+                                        task->repo_id,
+                                        task->repo_version,
+                                        file_id);
+    if (!file) {
+        seaf_warning ("Failed to find seafile object %s in repo %.8s.\n",
+                      file_id, task->repo_id);
         return -1;
     }
-    ((SeafileGetcsProc *)processor)->task = task;
 
-    if (ccnet_processor_startl (processor, NULL) < 0) {
-        seaf_warning ("failed to start get chunk server proc.\n");
+    int i;
+    char *block_id;
+    for (i = 0; i < file->n_blocks; ++i) {
+        block_id = file->blk_sha1s[i];
+        if (!seaf_block_manager_block_exists (seaf->block_mgr,
+                                              task->repo_id,
+                                              task->repo_version,
+                                              block_id))
+            g_queue_push_tail (task->block_ids, g_strdup(block_id));
+    }
+
+    seafile_unref (file);
+
+    if (g_queue_get_length (task->block_ids) == 0)
+        return BLOCK_CLIENT_SUCCESS;
+
+    BlockTxInfo *info = task->tx_info;
+    block_tx_client_run_command (info, BLOCK_CLIENT_CMD_TRANSFER);
+
+    /* Wait until block download is done. */
+    int rsp;
+    piperead (info->done_pipe[0], &rsp, sizeof(rsp));
+
+    while ((block_id = g_queue_pop_head(task->block_ids)) != NULL)
+        g_free (block_id);
+
+    return rsp;
+}
+
+/* Utility functions. */
+
+static BlockList *
+load_blocklist_with_local_history (TransferTask *task)
+{
+    BlockList *bl1, *bl2, *bl = NULL;
+    int i;
+    ObjectList *commits = task->commits;
+    char *commit_id;
+    SeafCommit *commit;
+    GList *parents = NULL;
+
+    /* Upload the blocks pointed by new commits, excluding
+     * blocks that have been uploaded before.
+     */
+
+    bl1 = block_list_new ();
+
+    for (i = 0; i < commits->obj_ids->len; ++i) {
+        commit_id = g_ptr_array_index (commits->obj_ids, i);
+        commit = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                                 task->repo_id,
+                                                 task->repo_version,
+                                                 commit_id);
+        if (!commit) {
+            seaf_warning ("Failed to get commit %s.\n", commit_id);
+            block_list_free (bl1);
+            return NULL;
+        }
+
+        if (seaf_fs_manager_populate_blocklist (seaf->fs_mgr,
+                                                task->repo_id,
+                                                task->repo_version,
+                                                commit->root_id,
+                                                bl1) < 0) {
+            seaf_commit_unref (commit);
+            block_list_free (bl1);
+            return NULL;
+        }
+
+        if (commit->parent_id && !object_list_exists (commits, commit->parent_id))
+            parents = g_list_prepend (parents, g_strdup(commit->parent_id));
+
+        if (commit->second_parent_id &&
+            !object_list_exists (commits, commit->second_parent_id))
+            parents = g_list_prepend (parents, g_strdup(commit->second_parent_id));
+
+        seaf_commit_unref (commit);
+    }
+
+    GList *p;
+    char *parent_id;
+    SeafCommit *parent;
+
+    for (p = parents; p; p = p->next) {
+        parent_id = p->data;
+        parent = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                                 task->repo_id,
+                                                 task->repo_version,
+                                                 parent_id);
+        if (!parent) {
+            block_list_free (bl1);
+            return NULL;
+        }
+
+        bl2 = block_list_new ();
+        if (seaf_fs_manager_populate_blocklist (seaf->fs_mgr,
+                                                task->repo_id,
+                                                task->repo_version,
+                                                parent->root_id, bl2) < 0) {
+            seaf_commit_unref (parent);
+            block_list_free (bl1);
+            block_list_free (bl2);
+            return NULL;
+        }
+
+        bl = block_list_difference (bl1, bl2);
+        block_list_free (bl1);
+        bl1 = bl;
+
+        seaf_commit_unref (parent);
+        block_list_free (bl2);
+    }
+
+    seaf_debug ("Uploading %u blocks.\n", bl1->n_blocks);
+
+    return bl1;
+}
+
+static int
+seaf_transfer_task_load_blocklist (TransferTask *task)
+{
+    SeafRepo *repo;
+    BlockList *bl;
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, task->repo_id);
+    if (!repo && !task->is_clone)
         return -1;
+
+    if (task->type == TASK_TYPE_UPLOAD) {
+        bl = load_blocklist_with_local_history (task);
+        if (!bl) {
+            seaf_warning ("[tr-mgr]Failed to populate blocklist.\n");
+            return -1;
+        }
+    } else {
+        SeafCommit *remote;
+
+        remote = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                                 task->repo_id,
+                                                 task->repo_version,
+                                                 task->head);
+        if (!remote) {
+            seaf_warning ("[tr-mgr] Failed to find commit %s.\n", task->head);
+            return -1;
+        }
+
+        if (!task->is_clone) {
+            /* If we're merging, only get new blocks that need to be checked out.
+             */
+            if (merge_get_new_block_list (repo, remote, &bl) < 0) {
+                seaf_warning ("[tr-mgr] Failed to get new blocks for merge.\n");
+                seaf_commit_unref (remote);
+                return -1;
+            }
+        } else {
+            /* If we're cloning, only get blocks pointed by the lastest commit.
+             */
+            bl = block_list_new ();
+            if (seaf_fs_manager_populate_blocklist (seaf->fs_mgr,
+                                                    task->repo_id,
+                                                    task->repo_version,
+                                                    remote->root_id,
+                                                    bl) < 0) {
+                seaf_warning ("[tr-mgr] Failed to get blocks of commit %s.\n",
+                           remote->commit_id);
+                seaf_commit_unref (remote);
+                return -1;
+            }
+        }
+        seaf_commit_unref (remote);
+
+        g_return_val_if_fail (bl != NULL, -1);
+    }
+
+    block_list_generate_bitmap (bl, task->repo_id, task->repo_version);
+
+    task->block_list = bl;
+
+    if (task->protocol_version <= 3) {
+        BitfieldConstruct (&task->active, bl->n_blocks);
+
+        if (task->type == TASK_TYPE_UPLOAD)
+            BitfieldConstruct (&task->uploaded, bl->n_blocks);
+    }
+
+    return 0;
+}
+
+typedef struct DiffTreesData {
+    BlockList *bl;
+    TransferTask *task;
+} DiffTreesData;
+
+static int
+diff_files (int n, const char *basedir, SeafDirent *files[], void *vdata)
+{
+    SeafDirent *file1 = files[0];
+    SeafDirent *file2 = files[1];
+    DiffTreesData *data = vdata;
+    BlockList *bl = data->bl;
+    TransferTask *task = data->task;
+    Seafile *f1 = NULL, *f2 = NULL;
+    int i;
+
+    if (file1 && strcmp (file1->id, EMPTY_SHA1) != 0) {
+        if (!file2) {
+            f1 = seaf_fs_manager_get_seafile (seaf->fs_mgr,
+                                              task->repo_id, task->repo_version,
+                                              file1->id);
+            if (!f1) {
+                seaf_warning ("Failed to get seafile object %s.\n", file1->id);
+                return -1;
+            }
+            for (i = 0; i < f1->n_blocks; ++i)
+                block_list_insert (bl, f1->blk_sha1s[i]);
+            seafile_unref (f1);
+        } else if (strcmp (file1->id, file2->id) != 0) {
+            f1 = seaf_fs_manager_get_seafile (seaf->fs_mgr,
+                                              task->repo_id, task->repo_version,
+                                              file1->id);
+            if (!f1) {
+                seaf_warning ("Failed to get seafile object %s.\n", file1->id);
+                return -1;
+            }
+            f2 = seaf_fs_manager_get_seafile (seaf->fs_mgr,
+                                              task->repo_id, task->repo_version,
+                                              file2->id);
+            if (!f2) {
+                seafile_unref (f1);
+                seaf_warning ("Failed to get seafile object %s.\n", file2->id);
+                return -1;
+            }
+
+            GHashTable *h = g_hash_table_new (g_str_hash, g_str_equal);
+            int dummy;
+            for (i = 0; i < f2->n_blocks; ++i)
+                g_hash_table_insert (h, f2->blk_sha1s[i], &dummy);
+
+            for (i = 0; i < f1->n_blocks; ++i)
+                if (!g_hash_table_lookup (h, f1->blk_sha1s[i]))
+                    block_list_insert (bl, f1->blk_sha1s[i]);
+
+            seafile_unref (f1);
+            seafile_unref (f2);
+            g_hash_table_destroy (h);
+        }
     }
 
     return 0;
 }
 
 static int
-get_chunk_server_list (TransferTask *task)
+diff_dirs (int n, const char *basedir, SeafDirent *dirs[], void *data,
+           gboolean *recurse)
 {
-    const char *dest_id = task->dest_id;
-
-    if (!dest_id)
-        return -1;
-
-    if (!ccnet_peer_is_ready (seaf->ccnetrpc_client, dest_id))
-        return -1;
-
-    if (start_getcs_proc (task, dest_id) < 0)
-        return -1;
-
+    /* Do nothing */
     return 0;
 }
 
+static int
+load_blocklist_v2 (TransferTask *task)
+{
+    int ret = 0;
+
+    SeafBranch *local = NULL, *master = NULL;
+    local = seaf_branch_manager_get_branch (seaf->branch_mgr, task->repo_id, "local");
+    if (!local) {
+        seaf_warning ("Branch local not found for repo %.8s.\n", task->repo_id);
+        ret = -1;
+        goto out;
+    }
+    master = seaf_branch_manager_get_branch (seaf->branch_mgr, task->repo_id, "master");
+    if (!master) {
+        seaf_warning ("Branch master not found for repo %.8s.\n", task->repo_id);
+        ret = -1;
+        goto out;
+    }
+
+    SeafCommit *local_head = NULL, *master_head = NULL;
+    local_head = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                                 task->repo_id, task->repo_version,
+                                                 local->commit_id);
+    if (!local_head) {
+        seaf_warning ("Local head commit not found for repo %.8s.\n",
+                      task->repo_id);
+        ret = -1;
+        goto out;
+    }
+    master_head = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                                 task->repo_id, task->repo_version,
+                                                 master->commit_id);
+    if (!master_head) {
+        seaf_warning ("Master head commit not found for repo %.8s.\n",
+                      task->repo_id);
+        ret = -1;
+        goto out;
+    }
+
+    BlockList *bl = block_list_new ();
+    DiffTreesData data;
+    data.bl = bl;
+    data.task = task;
+
+    DiffOptions opts;
+    memset (&opts, 0, sizeof(opts));
+    memcpy (opts.store_id, task->repo_id, 36);
+    opts.version = task->repo_version;
+    opts.file_cb = diff_files;
+    opts.dir_cb = diff_dirs;
+    opts.data = &data;
+
+    const char *trees[2];
+    trees[0] = local_head->root_id;
+    trees[1] = master_head->root_id;
+    if (diff_trees (2, trees, &opts) < 0) {
+        seaf_warning ("Failed to diff local and master head for repo %.8s.\n",
+                      task->repo_id);
+        ret = -1;
+        goto out;
+    }
+
+    task->block_list = bl;
+
+out:
+    seaf_branch_unref (local);
+    seaf_branch_unref (master);
+    seaf_commit_unref (local_head);
+    seaf_commit_unref (master_head);
+    return ret;
+}
+
+/*
+ * Loading block list may take a lot of disk I/O, so do it in a thread.
+ */
+
+typedef void (*LoadBLCB) (TransferTask *); 
+
+typedef struct LoadBLData {
+    TransferTask *task;
+    gboolean success;
+    LoadBLCB callback;
+} LoadBLData;
 
 static void
-tx_done_cb (CcnetProcessor *processor, gboolean success, void *data)
+load_block_list_done (void *vdata)
 {
-    TransferTask *task = data;
+    LoadBLData *data = vdata;
+    TransferTask *task = data->task;
 
-    if (!success && task->state == TASK_STATE_ERROR) {
-        /* block tx processor encountered non-recoverable error,
-         * such as access denied.
-         */
-        /* TODO: This is BUG */
-        free_task_resources (task);
-    } else {
-        /* Otherwise processs exits successfully, or the error is
-         * recoverable, restart processor later. 
-         */
-        g_hash_table_remove (task->processors, processor->peer_id);
+    if (task->state == TASK_STATE_CANCELED) {
+        transition_state (task, task->state, TASK_RT_STATE_FINISHED);
+        g_free (data);
+        return;
     }
+
+    if (data->success)
+        data->callback (task);
+    else
+        transition_state_to_error (task, TASK_ERR_LOAD_BLOCK_LIST);
+
+    g_free (data);
 }
 
-static CcnetProcessor *
-start_sendblock_proc (TransferTask *task, const char *peer_id)
+static void *
+load_block_list_thread (void *vdata)
 {
-    CcnetProcessor *processor;
+    LoadBLData *data = vdata;
+    int ret = 0;
 
-    if (!ccnet_peer_is_ready (seaf->ccnetrpc_client, peer_id))
-        return NULL;
+    if (data->task->protocol_version >= 7 &&
+        data->task->type == TASK_TYPE_UPLOAD)
+        ret = load_blocklist_v2 (data->task);
+    else
+        ret = seaf_transfer_task_load_blocklist (data->task);
 
-    processor = ccnet_proc_factory_create_remote_master_processor (
-        seaf->session->proc_factory, "seafile-sendblock-v2", peer_id);
-    if (!processor) {
-        seaf_warning ("failed to create sendblock proc.\n");
-        return NULL;
-    }
+    if (ret < 0)
+        data->success = FALSE;
+    else
+        data->success = TRUE;
 
-    ((SeafileSendblockV2Proc *)processor)->tx_task = task;
-    if (ccnet_processor_start (processor, 0, NULL) < 0) {
-        seaf_warning ("failed to start sendblock proc.\n");
-        return NULL;
-    }
-
-    g_signal_connect (processor, "done", (GCallback)tx_done_cb, task);
-
-    return processor;
+    return data;
 }
 
-static CcnetProcessor *
-start_getblock_proc (TransferTask *task, const char *peer_id)
+static int
+start_load_block_list_thread (TransferTask *task, LoadBLCB callback)
 {
-    CcnetProcessor *processor;
+    LoadBLData *data = g_new0 (LoadBLData, 1);
+    data->task = task;
+    data->callback = callback;
 
-    processor = ccnet_proc_factory_create_remote_master_processor (
-        seaf->session->proc_factory, "seafile-getblock-v2", peer_id);
-    if (!processor) {
-        seaf_warning ("failed to create getblock proc.\n");
-        return NULL;
-    }
-
-    ((SeafileGetblockV2Proc *)processor)->tx_task = task;
-    if (ccnet_processor_start (processor, 0, NULL) < 0) {
-        seaf_warning ("failed to start getblock proc.\n");
-        return NULL;
-    }
-
-    g_signal_connect (processor, "done", (GCallback)tx_done_cb, task);
-
-    return processor;
+    return ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                           load_block_list_thread,
+                                           load_block_list_done,
+                                           data);
 }
 
 static gboolean
@@ -1178,7 +1256,7 @@ static int
 update_local_repo (TransferTask *task);
 
 static void
-block_tx_client_done_cb (BlockTxInfo *info)
+block_tx_client_once_mode_done_cb (BlockTxInfo *info)
 {
     switch (info->result) {
     case BLOCK_CLIENT_SUCCESS:
@@ -1202,25 +1280,13 @@ block_tx_client_done_cb (BlockTxInfo *info)
         break;
     case BLOCK_CLIENT_NET_ERROR:
     case BLOCK_CLIENT_SERVER_ERROR:
-        /* Retry. */
-        if (++info->n_failure < 3) {
-            info->result = BLOCK_CLIENT_UNKNOWN;
-            if (block_tx_client_start (info, block_tx_client_done_cb) < 0) {
-                seaf_warning ("Failed to start block tx client.\n");
-                transition_state_to_error (info->task, TASK_ERR_START_BLOCK_CLIENT);
-                goto out;
-            }
-            return;
-        } else {
-            if (info->task->type == TASK_TYPE_UPLOAD)
-                transition_state_to_error (info->task, TASK_ERR_UPLOAD_BLOCKS);
-            else
-                transition_state_to_error (info->task, TASK_ERR_DOWNLOAD_BLOCKS);
-        }
+        if (info->task->type == TASK_TYPE_UPLOAD)
+            transition_state_to_error (info->task, TASK_ERR_UPLOAD_BLOCKS);
+        else
+            transition_state_to_error (info->task, TASK_ERR_DOWNLOAD_BLOCKS);
         break;
     }
 
-out:
     g_free (info->enc_session_key);
     pipeclose (info->cmd_pipe[0]);
     pipeclose (info->cmd_pipe[1]);
@@ -1228,7 +1294,7 @@ out:
 }
 
 static void
-start_block_tx_client (TransferTask *task)
+start_block_tx_client_run_once (TransferTask *task)
 {
     BlockTxInfo *info;
 
@@ -1249,15 +1315,117 @@ start_block_tx_client (TransferTask *task)
         return;
     }
 
+    /* For old syncing protocol, set block-tx-client to run-once mode. */
+    info->transfer_once = TRUE;
+
     task->tx_info = info;
 
-    if (block_tx_client_start (info, block_tx_client_done_cb) < 0) {
-        seaf_warning ("Failed to start block tx client for upload.\n");
+    if (block_tx_client_start (info, block_tx_client_once_mode_done_cb) < 0) {
+        seaf_warning ("Failed to start block tx client.\n");
         transition_state_to_error (task, TASK_ERR_START_BLOCK_CLIENT);
         return;
     }
 
     transition_state (task, task->state, TASK_RT_STATE_DATA);
+}
+
+static void
+block_tx_client_interactive_done_cb (BlockTxInfo *info)
+{
+    g_free (info->enc_session_key);
+    pipeclose (info->cmd_pipe[0]);
+    pipeclose (info->cmd_pipe[1]);
+    pipeclose (info->done_pipe[0]);
+    pipeclose (info->done_pipe[1]);
+    g_queue_free (info->task->block_ids);
+    g_free (info);
+}
+
+static void
+start_block_tx_client_interactive (TransferTask *task)
+{
+    BlockTxInfo *info;
+
+    info = g_new0 (BlockTxInfo, 1);
+
+    info->task = task;
+    /* Only use the first chunk server. */
+    info->cs = task->chunk_servers->data;
+
+    task->block_ids = g_queue_new();
+
+    if (generate_session_key (info, task->dest_id) < 0) {
+        transition_state_to_error (task, TASK_ERR_START_BLOCK_CLIENT);
+        return;
+    }
+
+    if (ccnet_pipe (info->cmd_pipe) < 0) {
+        seaf_warning ("Failed to create command pipe: %s.\n", strerror(errno));
+        transition_state_to_error (task, TASK_ERR_START_BLOCK_CLIENT);
+        return;
+    }
+
+    if (ccnet_pipe (info->done_pipe) < 0) {
+        seaf_warning ("Failed to create done pipe: %s.\n", strerror(errno));
+        transition_state_to_error (task, TASK_ERR_START_BLOCK_CLIENT);
+        return;
+    }
+
+    task->tx_info = info;
+
+    if (block_tx_client_start (info, block_tx_client_interactive_done_cb) < 0) {
+        seaf_warning ("Failed to start block tx client.\n");
+        transition_state_to_error (task, TASK_ERR_START_BLOCK_CLIENT);
+        return;
+    }
+
+    transition_state (task, task->state, TASK_RT_STATE_DATA);
+}
+
+typedef struct DownloadFilesData {
+    TransferTask *task;
+    int status;
+} DownloadFilesData;
+
+static void *
+download_and_checkout_files_thread (void *vdata)
+{
+    DownloadFilesData *data = vdata;
+    TransferTask *task = data->task;
+    gint ready;
+
+    do {
+        g_usleep (1000000);
+        ready = g_atomic_int_get (&task->tx_info->ready_for_transfer);
+    } while (ready == 0);
+
+    data->status = seaf_repo_fetch_and_checkout (task, task->head);
+
+    block_tx_client_run_command (task->tx_info, BLOCK_CLIENT_CMD_END);
+
+    return vdata;
+}
+
+static void
+download_and_checkout_files_done (void *vdata)
+{
+    DownloadFilesData *data = vdata;
+    TransferTask *task = data->task;
+
+    switch (data->status) {
+    case FETCH_CHECKOUT_SUCCESS:
+        if (update_local_repo (task) == 0)
+            transition_state (task, TASK_STATE_FINISHED, TASK_RT_STATE_FINISHED);
+        break;
+    case FETCH_CHECKOUT_FAILED:
+        transition_state_to_error (task, TASK_ERR_DOWNLOAD_BLOCKS);
+        break;
+    case FETCH_CHECKOUT_CANCELED:
+        transition_state (task, TASK_STATE_CANCELED, TASK_RT_STATE_FINISHED);
+        break;
+    }
+
+    g_free (vdata);
 }
 
 static void
@@ -1273,7 +1441,27 @@ on_getcs_v2_done (CcnetProcessor *processor, gboolean success, void *data)
     }
 
     if (success) {
-        start_block_tx_client (task);
+        if (task->type == TASK_TYPE_DOWNLOAD && task->protocol_version >= 7) {
+            /* Record download head commit id, so that we can resume download
+             * if this download is interrupted.
+             */
+            seaf_repo_manager_set_repo_property (seaf->repo_mgr,
+                                                 task->repo_id,
+                                                 REPO_PROP_DOWNLOAD_HEAD,
+                                                 task->head);
+
+            start_block_tx_client_interactive (task);
+
+            DownloadFilesData *data = g_new0 (DownloadFilesData, 1);
+            data->task = task;
+
+            /* This thread uses block-tx-client thread to download blocks. */
+            ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                            download_and_checkout_files_thread,
+                                            download_and_checkout_files_done,
+                                            data);
+        } else 
+            start_block_tx_client_run_once (task);
     } else if (task->state != TASK_STATE_ERROR) {
         transfer_task_with_proc_failure (
             task, processor, TASK_ERR_GET_CHUNK_SERVER);
@@ -1308,18 +1496,21 @@ start_getcommit_proc (TransferTask *task, const char *peer_id, GCallback done_cb
 {
     CcnetProcessor *processor;
 
-    if (task->protocol_version == 1)
-        processor = ccnet_proc_factory_create_remote_master_processor (
-                    seaf->session->proc_factory, "seafile-getcommit", peer_id);
-    else
+    if (task->protocol_version <= 5)
         processor = ccnet_proc_factory_create_remote_master_processor (
                     seaf->session->proc_factory, "seafile-getcommit-v2", peer_id);
+    else
+        processor = ccnet_proc_factory_create_remote_master_processor (
+                    seaf->session->proc_factory, "seafile-getcommit-v3", peer_id);
     if (!processor) {
         seaf_warning ("failed to create getcommit proc.\n");
         return -1;
     }
 
-    ((SeafileSendcommitProc *)processor)->tx_task = task;
+    if (task->protocol_version <= 5)
+        ((SeafileGetcommitV2Proc *)processor)->tx_task = task;
+    else
+        ((SeafileGetcommitV3Proc *)processor)->tx_task = task;
     g_signal_connect (processor, "done", done_cb, task);
 
     if (ccnet_processor_startl (processor, NULL) < 0) {
@@ -1336,8 +1527,12 @@ start_getfs_proc (TransferTask *task, const char *peer_id, GCallback done_cb)
 {
     CcnetProcessor *processor;
 
-    processor = ccnet_proc_factory_create_remote_master_processor (
-        seaf->session->proc_factory, "seafile-getfs", peer_id);
+    if (task->protocol_version <= 6)
+        processor = ccnet_proc_factory_create_remote_master_processor (
+            seaf->session->proc_factory, "seafile-getfs", peer_id);
+    else
+        processor = ccnet_proc_factory_create_remote_master_processor (
+            seaf->session->proc_factory, "seafile-getfs-v2", peer_id);
     if (!processor) {
         seaf_warning ("failed to create getfs proc.\n");
         return -1;
@@ -1352,92 +1547,6 @@ start_getfs_proc (TransferTask *task, const char *peer_id, GCallback done_cb)
     }
 
     return 0;
-}
-
-
-/**
- * Error handling:
- *
- * When a task is running in RT_STATE_INIT, COMMIT or FS, if we fail to
- * start a processor we'll set task state to TASK_STATE_ERROR.
- * The user can manually resume this task if needed.
- * If in these stages the relay suddenly goes off-line, we'll set runtime
- * state to RT_STATE_INIT and retry in the next schedule interval.
- *
- * When a task is running in RT_STATE_DATA, any processor error is
- * tolerated. We'll continuously retry.
- */
-
-static void
-download_dispatch_blocks_to_processor (TransferTask *task,
-                                       SeafileGetblockV2Proc *proc,
-                                       guint n_procs)
-{
-    CcnetProcessor *processor = (CcnetProcessor *)proc;
-    int expected, n_blocks, n_scheduled = 0;
-    int i;
-
-    if (!seafile_getblock_v2_proc_is_ready (proc))
-        return;
-
-    expected = MIN (proc->block_bitmap.bitCount/n_procs, MAX_QUEUED_BLOCKS);
-    n_blocks = expected - proc->pending_blocks;
-    if (n_blocks <= 0)
-        return;
-
-    seaf_debug ("expected: %d, pending: %d.\n", expected, proc->pending_blocks);
-
-    for (i = 0; i < proc->block_bitmap.bitCount; ++i) {
-        if (n_scheduled == n_blocks)
-            break;
-
-        if (BitfieldHasFast (&proc->block_bitmap, i) &&
-            !BitfieldHasFast (&task->block_list->block_map, i) &&
-            !BitfieldHasFast (&task->active, i))
-        {
-            const char *block_id;
-            block_id = g_ptr_array_index (task->block_list->block_ids, i);
-            seaf_debug ("Transfer repo %.8s: schedule block %.8s to %.8s.\n",
-                        task->repo_id, block_id, processor->peer_id);
-            seafile_getblock_v2_proc_get_block (proc, i);
-            BitfieldAdd (&task->active, i);
-            ++n_scheduled;
-        }
-    }
-}
-
-static void
-download_dispatch_blocks (TransferTask *task)
-{
-    GHashTableIter iter;
-    gpointer key, value;
-    SeafileGetblockV2Proc *proc;
-    guint n_procs = g_hash_table_size (task->processors);
-
-    g_hash_table_iter_init (&iter, task->processors);
-    while (g_hash_table_iter_next (&iter, &key, &value)) {
-        proc = value;
-        download_dispatch_blocks_to_processor (task, proc, n_procs);
-    }
-}
-
-static void
-start_chunk_server_download (TransferTask *task)
-{
-    GList *ptr = task->chunk_servers;
-    const char *cs_id;
-    CcnetProcessor *processor;
-
-    while (ptr) {
-        cs_id = ptr->data;
-        if (!g_hash_table_lookup (task->processors, cs_id)) {
-            processor = start_getblock_proc (task, cs_id);
-            if (processor != NULL) {
-                g_hash_table_insert (task->processors, g_strdup(cs_id), processor);
-            }
-        }
-        ptr = ptr->next;
-    }
 }
 
 static void
@@ -1461,18 +1570,13 @@ copy_block_ids_for_download (TransferTask *task)
 static void
 start_block_download (TransferTask *task)
 {
-    if (task->protocol_version <= 3) {
-        transition_state (task, task->state, TASK_RT_STATE_DATA);
-        state_machine_tick (task);
+    if (task->block_list->n_blocks == task->block_list->n_valid_blocks) {
+        seaf_debug ("No block to download.\n");
+        if (update_local_repo (task) == 0)
+            transition_state (task, TASK_STATE_FINISHED, TASK_RT_STATE_FINISHED);
     } else {
-        if (task->block_list->n_blocks == task->block_list->n_valid_blocks) {
-            seaf_debug ("No block to download.\n");
-            if (update_local_repo (task) == 0)
-                transition_state (task, TASK_STATE_FINISHED, TASK_RT_STATE_FINISHED);
-        } else {
-            copy_block_ids_for_download (task);
-            get_chunk_server_address (task);
-        }
+        copy_block_ids_for_download (task);
+        get_chunk_server_address (task);
     }
 }
 
@@ -1489,7 +1593,10 @@ on_fs_downloaded (CcnetProcessor *processor, gboolean success, void *data)
     }
 
     if (success) {
-        start_load_block_list_thread (task, start_block_download);
+        if (task->protocol_version <= 6)
+            start_load_block_list_thread (task, start_block_download);
+        else
+            get_chunk_server_address (task);
     } else if (task->state != TASK_STATE_ERROR
                && task->runtime_state == TASK_RT_STATE_FS) {
         transfer_task_with_proc_failure (
@@ -1509,6 +1616,8 @@ start_fs_download (TransferTask *task, const char *peer_id)
     if (task->protocol_version == 1) {
         ol = object_list_new ();
         ret = seaf_commit_manager_traverse_commit_tree (seaf->commit_mgr,
+                                                        task->repo_id,
+                                                        task->repo_version,
                                                         task->head,
                                                         fs_root_collector,
                                                         ol, FALSE);
@@ -1520,7 +1629,8 @@ start_fs_download (TransferTask *task, const char *peer_id)
         task->fs_roots = ol;
     }
 
-    if (object_list_length(task->fs_roots) == 0) {
+    if (task->protocol_version <= 6 &&
+        object_list_length(task->fs_roots) == 0) {
         if (update_local_repo (task) == 0)
             transition_state (task, TASK_STATE_FINISHED, TASK_RT_STATE_FINISHED);
         return;
@@ -1594,29 +1704,7 @@ check_download_cb (CcnetProcessor *processor, gboolean success, void *data)
     }
 
     if (success) {
-        /* Save remote head id for use in GC.
-         * GC can then mark the blocks refered by these head ids as alive.
-         */
-        save_clone_head (task, task->head);
-
         start_commit_download (task);
-    } else if (processor->failure == PROC_NO_SERVICE) {
-        /* Talking to an old server. */
-        CcnetProcessor *v2_proc;
-
-        v2_proc = ccnet_proc_factory_create_remote_master_processor (
-            seaf->session->proc_factory, "seafile-check-tx-v2", task->dest_id);
-        if (!v2_proc) {
-            seaf_warning ("failed to create check-tx-v2 proc for download.\n");
-            transition_state_to_error (task, TASK_ERR_CHECK_DOWNLOAD_START);
-        }
-
-        g_signal_connect (v2_proc, "done", (GCallback)check_download_cb, task);
-
-        ((SeafileCheckTxV2Proc *)v2_proc)->task = task;
-        if (ccnet_processor_startl (v2_proc, "download", NULL) < 0)
-            seaf_warning ("failed to start check-tx-v2 proc for download.\n");
-
     } else if (task->state != TASK_STATE_ERROR
                && task->runtime_state == TASK_RT_STATE_CHECK) {
         transfer_task_with_proc_failure (
@@ -1667,10 +1755,15 @@ update_local_repo (TransferTask *task)
     SeafRepo *repo;
     SeafCommit *new_head;
     SeafBranch *branch;
+    int ret = 0;
 
-    new_head = seaf_commit_manager_get_commit (seaf->commit_mgr, task->head);
+    new_head = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                               task->repo_id,
+                                               task->repo_version,
+                                               task->head);
     if (!new_head) {
         seaf_warning ("Failed to get commit %s.\n", task->head);
+        transition_state_to_error (task, TASK_ERR_UNKNOWN);
         return -1;
     }
 
@@ -1678,20 +1771,28 @@ update_local_repo (TransferTask *task)
      * Note that branch doesn't exist either in this case.
      */
     repo = seaf_repo_manager_get_repo (seaf->repo_mgr, new_head->repo_id);
-    if (!repo && task->is_clone) {
+    if (task->is_clone) {
+        if (repo != NULL)
+            goto out;
+
         repo = seaf_repo_new (new_head->repo_id, NULL, NULL);
         if (repo == NULL) {
             /* create repo failed */
             transition_state_to_error (task, TASK_ERR_UNKNOWN);
-            return -1;
+            ret = -1;
+            goto out;
         }
 
         seaf_repo_from_commit (repo, new_head);
 
         seaf_repo_manager_add_repo (seaf->repo_mgr, repo);
 
-        /* If it's a new repo, create 'local' branch */
+        /* If it's a new repo, create 'local' and 'master' branch */
         branch = seaf_branch_new ("local", task->repo_id, task->head);
+        seaf_branch_manager_add_branch (seaf->branch_mgr, branch);
+        seaf_branch_unref (branch);
+
+        branch = seaf_branch_new ("master", task->repo_id, task->head);
         seaf_branch_manager_add_branch (seaf->branch_mgr, branch);
         seaf_branch_unref (branch);
 
@@ -1700,40 +1801,36 @@ update_local_repo (TransferTask *task)
             seaf_repo_manager_set_repo_relay_id (seaf->repo_mgr, repo,
                                                  task->dest_id);
         }
-    } else if (!repo) {
-        /* The repo was deleted when we're downloading it. */
-        return 0;
-    }
-
-    branch = seaf_branch_manager_get_branch (seaf->branch_mgr, 
-                                             task->repo_id,
-                                             task->to_branch);
-    if (!branch) {
-        branch = seaf_branch_new (task->to_branch, task->repo_id, task->head);
-        seaf_branch_manager_add_branch (seaf->branch_mgr, branch);
     } else {
-        /* If branch exists, make sure it's not the current branch of repo.
-         * We don't allow fetching to the current branch.
-         */
-        if (repo->head && strcmp (branch->name, repo->head->name) == 0) {
-            seaf_warning ("Refuse fetching to current branch %s.\n", repo->head->name);
-            /* This should not happen in our restricted user model,
-             * just set to unknown error.
-             */
+        if (!repo) {
             transition_state_to_error (task, TASK_ERR_UNKNOWN);
-            seaf_commit_unref (new_head);
-            seaf_branch_unref (branch);
-            return -1;
+            ret = -1;
+            goto out;
         }
 
-        /* Update branch */
+        branch = seaf_branch_manager_get_branch (seaf->branch_mgr, 
+                                                 task->repo_id,
+                                                 "master");
+        if (!branch) {
+            seaf_warning ("Branch master not found for repo %.8s.\n", task->repo_id);
+            transition_state_to_error (task, TASK_ERR_UNKNOWN);
+            ret = -1;
+            goto out;
+        }
         seaf_branch_set_commit (branch, new_head->commit_id);
         seaf_branch_manager_update_branch (seaf->branch_mgr, branch);
+        seaf_branch_unref (branch);
+
+        /* Update repo head branch. */
+        if (task->protocol_version >= 7) {
+            seaf_branch_set_commit (repo->head, new_head->commit_id);
+            seaf_branch_manager_update_branch (seaf->branch_mgr, repo->head);
+        }
     }
 
-    seaf_branch_unref (branch);
+out:
     seaf_commit_unref (new_head);
-    return 0;
+    return ret;
 }
 
 
@@ -1751,33 +1848,11 @@ schedule_download_task (TransferTask *task)
     if (task->is_clone && s_info != NULL && s_info->in_sync)
         return;
 
-    char *dest_id = task->dest_id;
-
     switch (task->runtime_state) {
     case TASK_RT_STATE_INIT:
         start_download (task);
         break;
     case TASK_RT_STATE_DATA:
-        if (task->protocol_version >= 4)
-            break;
-
-        if (task->block_list->n_valid_blocks == task->block_list->n_blocks) {
-            update_local_repo (task);
-            free_task_resources (task);
-            transition_state (task, TASK_STATE_FINISHED, TASK_RT_STATE_FINISHED);
-            break;
-        }
-
-        if (task->chunk_servers == NULL) {
-            if (is_peer_relay (dest_id))
-                get_chunk_server_list (task);
-            else
-                task->chunk_servers = g_list_prepend (task->chunk_servers, 
-                                                      g_strdup(dest_id));
-        }
-
-        start_chunk_server_download (task);
-        download_dispatch_blocks (task);
         break;
     default:
         break;
@@ -1791,8 +1866,12 @@ start_sendfs_proc (TransferTask *task, const char *peer_id, GCallback done_cb)
 {
     CcnetProcessor *processor;
 
-    processor = ccnet_proc_factory_create_remote_master_processor (
-        seaf->session->proc_factory, "seafile-sendfs", peer_id);
+    if (task->protocol_version <= 6)
+        processor = ccnet_proc_factory_create_remote_master_processor (
+            seaf->session->proc_factory, "seafile-sendfs", peer_id);
+    else
+        processor = ccnet_proc_factory_create_remote_master_processor (
+            seaf->session->proc_factory, "seafile-sendfs-v2", peer_id);
     if (!processor) {
         seaf_warning ("failed to create sendfs proc.\n");
         return -1;
@@ -1814,26 +1893,21 @@ start_sendcommit_proc (TransferTask *task, const char *peer_id, GCallback done_c
 {
     CcnetProcessor *processor;
 
-    switch (task->protocol_version) {
-    case 1:
-        processor = ccnet_proc_factory_create_remote_master_processor (
-                    seaf->session->proc_factory, "seafile-sendcommit", peer_id);
-        break;
-    case 2:
-        processor = ccnet_proc_factory_create_remote_master_processor (
-                    seaf->session->proc_factory, "seafile-sendcommit-v2", peer_id);
-        break;
-    default:
+    if (task->protocol_version <= 5)
         processor = ccnet_proc_factory_create_remote_master_processor (
                     seaf->session->proc_factory, "seafile-sendcommit-v3", peer_id);
-        break;
-    }
+    else if (task->protocol_version == 6)
+        processor = ccnet_proc_factory_create_remote_master_processor (
+                    seaf->session->proc_factory, "seafile-sendcommit-v3-new", peer_id);
+    else
+        processor = ccnet_proc_factory_create_remote_master_processor (
+                    seaf->session->proc_factory, "seafile-sendcommit-v4", peer_id);
     if (!processor) {
         seaf_warning ("failed to create sendcommit proc.\n");
         return -1;
     }
 
-    ((SeafileSendcommitProc *)processor)->tx_task = task;
+    ((SeafileSendcommitV3Proc *)processor)->tx_task = task;
     g_signal_connect (processor, "done", done_cb, task);
 
     if (ccnet_processor_startl (processor, NULL) < 0) {
@@ -1952,6 +2026,10 @@ start_check_block_list_proc (TransferTask *task)
     processor = ccnet_proc_factory_create_remote_master_processor (
                 seaf->session->proc_factory, "seafile-checkbl", task->dest_id);
     ((SeafileCheckblProc *)processor)->task = task;
+    if (task->protocol_version < 6)
+        ((SeafileCheckblProc *)processor)->send_session_token = FALSE;
+    else
+        ((SeafileCheckblProc *)processor)->send_session_token = TRUE;
     g_signal_connect (processor, "done", (GCallback)on_checkbl_done, task);
 
     if (ccnet_processor_startl (processor, NULL) < 0) {
@@ -1965,22 +2043,19 @@ start_check_block_list_proc (TransferTask *task)
 static void
 start_block_upload (TransferTask *task)
 {
+#if 0
     if (task->block_list->n_valid_blocks != task->block_list->n_blocks) {
         seaf_warning ("Some blocks are missing locally, stop upload.\n");
         transition_state_to_error (task, TASK_ERR_LOAD_BLOCK_LIST); 
         return;
     }
+#endif
 
-    if (task->protocol_version <= 3) {
-        transition_state (task, task->state, TASK_RT_STATE_DATA);
-        state_machine_tick (task);
-    } else {
-        if (task->block_list->n_blocks == 0) {
-            seaf_debug ("No block to upload.\n");
-            update_remote_branch (task);
-        } else
-            start_check_block_list_proc (task);
-    }
+    if (task->block_list->n_blocks == 0) {
+        seaf_debug ("No block to upload.\n");
+        update_remote_branch (task);
+    } else
+        start_check_block_list_proc (task);
 }
 
 static void
@@ -2016,6 +2091,8 @@ start_fs_upload (TransferTask *task, const char *peer_id)
     if (task->protocol_version == 1) {
         ol = object_list_new ();
         ret = seaf_commit_manager_traverse_commit_tree (seaf->commit_mgr,
+                                                        task->repo_id,
+                                                        task->repo_version,
                                                         task->head,
                                                         fs_root_collector,
                                                         ol, FALSE);
@@ -2027,7 +2104,8 @@ start_fs_upload (TransferTask *task, const char *peer_id)
         task->fs_roots = ol;
     }
 
-    if (object_list_length(task->fs_roots) == 0) {
+    if (task->protocol_version <= 6 &&
+        object_list_length(task->fs_roots) == 0) {
         update_remote_branch (task);
         return;
     }
@@ -2091,23 +2169,6 @@ check_upload_cb (CcnetProcessor *processor, gboolean success, void *data)
 
     if (success) {
         start_commit_upload (task);
-    } else if (processor->failure == PROC_NO_SERVICE) {
-        /* Talking to an old server. */
-        CcnetProcessor *v2_proc;
-
-        v2_proc = ccnet_proc_factory_create_remote_master_processor (
-            seaf->session->proc_factory, "seafile-check-tx-v2", task->dest_id);
-        if (!v2_proc) {
-            seaf_warning ("failed to create check-tx-v2 proc for upload.\n");
-            transition_state_to_error (task, TASK_ERR_CHECK_UPLOAD_START);
-        }
-
-        g_signal_connect (v2_proc, "done", (GCallback)check_upload_cb, task);
-
-        ((SeafileCheckTxV2Proc *)v2_proc)->task = task;
-        if (ccnet_processor_startl (v2_proc, "upload", NULL) < 0)
-            seaf_warning ("failed to start check-tx-v2 proc for upload.\n");
-
     } else if (task->state != TASK_STATE_ERROR
                && task->runtime_state == TASK_RT_STATE_CHECK) {
         transfer_task_with_proc_failure (
@@ -2165,78 +2226,6 @@ start_upload (TransferTask *task)
 }
 
 static void
-start_chunk_server_upload (TransferTask *task)
-{
-    GList *ptr = task->chunk_servers;
-    const char *cs_id;
-    CcnetProcessor *processor;
-
-    while (ptr) {
-        cs_id = ptr->data;
-        if (!g_hash_table_lookup (task->processors, cs_id)) {
-            processor = start_sendblock_proc (task, cs_id);
-            if (processor != NULL) {
-                g_hash_table_insert (task->processors, g_strdup(cs_id), processor);
-            }
-        }
-        ptr = ptr->next;
-    }
-}
-
-static void
-upload_dispatch_blocks_to_processor (TransferTask *task,
-                                     SeafileSendblockV2Proc *proc,
-                                     guint n_procs)
-{
-    CcnetProcessor *processor = (CcnetProcessor *)proc;
-    int expected, n_blocks, n_scheduled = 0;
-    int i;
-
-    if (!seafile_sendblock_v2_proc_is_ready (proc))
-        return;
-
-    expected = MIN (task->uploaded.bitCount/n_procs, MAX_QUEUED_BLOCKS);
-    n_blocks = expected - proc->pending_blocks;
-    if (n_blocks <= 0)
-        return;
-
-    seaf_debug ("expected: %d, pending: %d.\n", expected, proc->pending_blocks);
-
-    for (i = 0; i < task->uploaded.bitCount; ++i) {
-        if (n_scheduled == n_blocks)
-            break;
-
-        if (!BitfieldHasFast (&task->uploaded, i) &&
-            BitfieldHasFast (&task->block_list->block_map, i) &&
-            !BitfieldHasFast (&task->active, i))
-        {
-            const char *block_id;
-            block_id = g_ptr_array_index (task->block_list->block_ids, i);
-            seaf_debug ("Transfer repo %.8s: schedule block %.8s to %.8s.\n",
-                     task->repo_id, block_id, processor->peer_id);
-            seafile_sendblock_v2_proc_send_block (proc, i);
-            BitfieldAdd (&task->active, i);
-            ++n_scheduled;
-        }
-    }
-}
-
-static void
-upload_dispatch_blocks (TransferTask *task)
-{
-    GHashTableIter iter;
-    gpointer key, value;
-    SeafileSendblockV2Proc *proc;
-    guint n_procs = g_hash_table_size (task->processors);
-
-    g_hash_table_iter_init (&iter, task->processors);
-    while (g_hash_table_iter_next (&iter, &key, &value)) {
-        proc = value;
-        upload_dispatch_blocks_to_processor (task, proc, n_procs);
-    }
-}
-
-static void
 schedule_upload_task (TransferTask *task)
 {
     switch (task->runtime_state) {
@@ -2244,20 +2233,6 @@ schedule_upload_task (TransferTask *task)
         start_upload (task);
         break;
     case TASK_RT_STATE_DATA:
-        if (task->protocol_version >= 4)
-            break;
-
-        if (task->n_uploaded == task->block_list->n_blocks) {
-            free_task_resources (task);
-            update_remote_branch (task);
-            break;
-        }
-
-        if (task->chunk_servers == NULL)
-            get_chunk_server_list (task);
-        start_chunk_server_upload (task);
-        upload_dispatch_blocks (task);
-
         break;
     default:
         break;
@@ -2266,51 +2241,6 @@ schedule_upload_task (TransferTask *task)
 
 
 /* -------- schedule -------- */
-
-static gboolean
-collect_block_processor (gpointer key, gpointer value, gpointer data)
-{
-    CcnetProcessor *processor = value;
-    GList **pproc_list = data;
-
-    *pproc_list = g_list_prepend (*pproc_list, processor);
-
-    return TRUE;
-}
-
-static void
-free_task_resources (TransferTask *task)
-{
-    GList *proc_list = NULL;
-    GList *ptr;
-
-    /* We must first move processors from the hash table into
-     * a list, because tx_done_cb() tries to remove the proc
-     * from the hash table too. We can't remove an element
-     * from the hash table while traversing it.
-     */
-    g_hash_table_foreach_remove (task->processors,
-                                 collect_block_processor,
-                                 &proc_list);
-    ptr = proc_list;
-    while (ptr != NULL) {
-        CcnetProcessor *processor = ptr->data;
-        ccnet_processor_done (processor, TRUE);
-        ptr = g_list_delete_link (ptr, ptr);
-    }
-
-    block_list_free (task->block_list);
-    task->block_list = NULL;
-    BitfieldDestruct (&task->active);
-
-    for (ptr = task->chunk_servers; ptr; ptr = ptr->next) 
-        g_free (ptr->data);
-    g_list_free (task->chunk_servers);
-    task->chunk_servers = NULL;
-
-    if (task->type == TASK_TYPE_UPLOAD)
-        BitfieldDestruct (&task->uploaded);
-}
 
 static void resume_task_from_netdown(TransferTask *task, const char *dest_id)
 {
@@ -2393,12 +2323,6 @@ state_machine_tick (TransferTask *task)
         break;
     case TASK_STATE_CANCELED:
         /* state #11 */
-        if (task->protocol_version <= 3 &&
-            task->runtime_state == TASK_RT_STATE_DATA) {
-            free_task_resources (task);
-            /* transition to state #12 */
-            transition_state (task, TASK_STATE_CANCELED, TASK_RT_STATE_FINISHED);
-        }
         break;
     case TASK_STATE_ERROR:
         /* state #14 */

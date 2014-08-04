@@ -93,7 +93,7 @@ start (CcnetProcessor *processor, int argc, char **argv)
         return -1;
     }
 
-    if (strlen(argv[0]) != 36 || strlen(argv[2]) != 40) {
+    if (!is_uuid_valid(argv[0]) || strlen(argv[2]) != 40) {
         ccnet_processor_send_response (processor, SC_BAD_ARGS, SS_BAD_ARGS, NULL, 0);
         ccnet_processor_done (processor, FALSE);
         return -1;
@@ -136,23 +136,14 @@ update_repo (void *vprocessor)
 {
     CcnetProcessor *processor = vprocessor;
     USE_PRIV;
-    char *repo_id, *branch_name, *new_head;
+    char *repo_id, *new_head;
     SeafRepo *repo = NULL;
     SeafBranch *branch = NULL;
     SeafCommit *commit = NULL;
     char old_commit_id[41];
 
     repo_id = priv->repo_id;
-    branch_name = priv->branch_name;
     new_head = priv->new_head;
-
-    /* Since this is the last step of upload procedure, commit should exist. */
-    commit = seaf_commit_manager_get_commit (seaf->commit_mgr, new_head);
-    if (!commit) {
-        priv->rsp_code = g_strdup (SC_BAD_COMMIT);
-        priv->rsp_msg = g_strdup (SS_BAD_COMMIT);
-        goto out;
-    }
 
     repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
     if (!repo) {
@@ -163,13 +154,23 @@ update_repo (void *vprocessor)
 
     }
 
+    /* Since this is the last step of upload procedure, commit should exist. */
+    commit = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                             repo->id, repo->version,
+                                             new_head);
+    if (!commit) {
+        priv->rsp_code = g_strdup (SC_BAD_COMMIT);
+        priv->rsp_msg = g_strdup (SS_BAD_COMMIT);
+        goto out;
+    }
+
     if (seaf_quota_manager_check_quota (seaf->quota_mgr, repo_id) < 0) {
         priv->rsp_code = g_strdup(SC_QUOTA_FULL);
         priv->rsp_msg = g_strdup(SS_QUOTA_FULL);
         goto out;
     }
 
-    branch = seaf_branch_manager_get_branch (seaf->branch_mgr, repo_id, branch_name);
+    branch = seaf_branch_manager_get_branch (seaf->branch_mgr, repo_id, "master");
     if (!branch) {
         priv->rsp_code = g_strdup (SC_BAD_BRANCH);
         priv->rsp_msg = g_strdup (SS_BAD_BRANCH);
@@ -178,7 +179,7 @@ update_repo (void *vprocessor)
 
     /* If branch exists, check fast forward. */
     if (strcmp (new_head, branch->commit_id) != 0 &&
-        !is_fast_forward (new_head, branch->commit_id)) {
+        !is_fast_forward (repo->id, repo->version, new_head, branch->commit_id)) {
         g_warning ("Upload is not fast forward. Refusing.\n");
 
         seaf_repo_unref (repo);

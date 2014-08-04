@@ -21,6 +21,7 @@ seaf_controller="${INSTALLPATH}/seafile/bin/seafile-controller"
 
 
 export PATH=${INSTALLPATH}/seafile/bin:$PATH
+export ORIG_LD_LIBRARY_PATH=${LD_LIBRARY_PATH}
 export SEAFILE_LD_LIBRARY_PATH=${INSTALLPATH}/seafile/lib/:${INSTALLPATH}/seafile/lib64:${LD_LIBRARY_PATH}
 
 script_name=$0
@@ -70,7 +71,7 @@ function check_component_running() {
     name=$1
     cmd=$2
     if pid=$(pgrep -f "$cmd" 2>/dev/null); then
-        echo "[$name] is running, pid $pid. You can stop is by: "
+        echo "[$name] is running, pid $pid. You can stop it by: "
         echo
         echo "        kill $pid"
         echo
@@ -89,7 +90,8 @@ function validate_already_running () {
 
     check_component_running "ccnet-server" "ccnet-server -c ${default_ccnet_conf_dir}"
     check_component_running "seaf-server" "seaf-server -c ${default_ccnet_conf_dir}"
-    check_component_running "httpserver" "httpserver -c ${default_ccnet_conf_dir}"
+    check_component_running "fileserver" "fileserver -c ${default_ccnet_conf_dir}"
+    check_component_running "seafdav" "wsgidav.server.run_server"
 }
 
 function start_seafile_server () {
@@ -124,7 +126,9 @@ function stop_seafile_server () {
     pkill -SIGTERM -f "seafile-controller -c ${default_ccnet_conf_dir}"
     pkill -f "ccnet-server -c ${default_ccnet_conf_dir}"
     pkill -f "seaf-server -c ${default_ccnet_conf_dir}"
-    pkill -f "httpserver -c ${default_ccnet_conf_dir}"
+    pkill -f "fileserver -c ${default_ccnet_conf_dir}"
+    pkill -f "soffice.*--invisible --nocrashreport"
+    pkill -f  "wsgidav.server.run_server"
     return 0
 }
 

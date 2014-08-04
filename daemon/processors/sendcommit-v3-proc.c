@@ -121,12 +121,14 @@ send_commit_start (CcnetProcessor *processor, int argc, char **argv)
 static void
 send_commit (CcnetProcessor *processor, const char *object_id)
 {
+    TransferTask *task = ((SeafileSendcommitV3Proc *)processor)->tx_task;
     char *data;
     int len;
     ObjectPack *pack = NULL;
     int pack_size;
 
     if (seaf_obj_store_read_obj (seaf->commit_mgr->obj_store,
+                                 task->repo_id, task->repo_version,
                                  object_id, (void**)&data, &len) < 0) {
         g_warning ("Failed to read commit %s.\n", object_id);
         goto fail;
@@ -273,6 +275,8 @@ compute_delta_commits (CcnetProcessor *processor, const char *head)
                                                g_free, NULL);
 
     ret = seaf_commit_manager_traverse_commit_tree (seaf->commit_mgr,
+                                                    task->repo_id,
+                                                    task->repo_version,
                                                     priv->remote_id,
                                                     traverse_commit_remote,
                                                     processor, FALSE);
@@ -281,6 +285,8 @@ compute_delta_commits (CcnetProcessor *processor, const char *head)
     }
 
     ret = seaf_commit_manager_traverse_commit_tree (seaf->commit_mgr,
+                                                    task->repo_id,
+                                                    task->repo_version,
                                                     head,
                                                     compute_delta,
                                                     processor, FALSE);
@@ -302,6 +308,8 @@ compute_upload_commits_thread (void *vdata)
 
     priv->fast_forward = TRUE;
     ret = seaf_commit_manager_traverse_commit_tree (seaf->commit_mgr,
+                                                    task->repo_id,
+                                                    task->repo_version,
                                                     task->head,
                                                     traverse_commit_fast_forward,
                                                     processor, FALSE);

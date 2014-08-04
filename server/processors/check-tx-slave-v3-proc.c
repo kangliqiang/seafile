@@ -68,6 +68,7 @@ typedef struct {
     char *session_key;
     char *peer_addr;
     char *peer_name;
+    int client_version;
 
     char *rsp_code;
     char *rsp_msg;
@@ -212,10 +213,21 @@ check_tx (void *vprocessor)
 
     char *user = NULL;
     char *repo_id = priv->repo_id;
+    SeafRepo *repo = NULL;
 
-    if (!seaf_repo_manager_repo_exists (seaf->repo_mgr, repo_id)) {
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+    if (!repo) {
         priv->rsp_code = g_strdup(SC_BAD_REPO);
         priv->rsp_msg = g_strdup(SS_BAD_REPO);
+        goto out;
+    }
+
+    if (repo->version > 0 && priv->client_version < 6) {
+        seaf_warning ("Client protocol version is %d, "
+                      "cannot sync version %d repo %s.\n",
+                      priv->client_version, repo->version, repo_id);
+        priv->rsp_code = g_strdup(SC_PROTOCOL_MISMATCH);
+        priv->rsp_msg = g_strdup(SS_PROTOCOL_MISMATCH);
         goto out;
     }
 
@@ -272,6 +284,7 @@ check_tx (void *vprocessor)
     get_branch_head (processor);
 
 out:
+    seaf_repo_unref (repo);
     g_free (user);
     return vprocessor;    
 }
@@ -301,7 +314,7 @@ thread_done (void *result)
 static int
 start (CcnetProcessor *processor, int argc, char **argv)
 {
-    char *repo_id, *branch_name, *token;
+    char *repo_id, *token;
     USE_PRIV;
 
     if (argc != 5) {
@@ -321,8 +334,8 @@ start (CcnetProcessor *processor, int argc, char **argv)
     }
 
     int client_version = atoi(argv[1]);
-    if (client_version == 4) {
-        seaf_debug ("Client protocol version is 4, not supported.\n");
+    if (client_version < 5) {
+        seaf_debug ("Client protocol version lower than 5, not supported.\n");
         ccnet_processor_send_response (processor,
                                        SC_PROTOCOL_MISMATCH, SS_PROTOCOL_MISMATCH,
                                        NULL, 0);
@@ -331,26 +344,19 @@ start (CcnetProcessor *processor, int argc, char **argv)
     }
 
     repo_id = argv[2];
-    branch_name = argv[3];
     token = argv[4];
 
-    if (strlen(repo_id) != 36) {
-        ccnet_processor_send_response (processor, SC_BAD_ARGS, SS_BAD_ARGS, NULL, 0);
-        ccnet_processor_done (processor, FALSE);
-        return -1;
-    }
-
-    if (priv->type == CHECK_TX_TYPE_UPLOAD &&
-        strcmp (branch_name, "master") != 0) {
+    if (!is_uuid_valid(repo_id)) {
         ccnet_processor_send_response (processor, SC_BAD_ARGS, SS_BAD_ARGS, NULL, 0);
         ccnet_processor_done (processor, FALSE);
         return -1;
     }
 
     memcpy (priv->repo_id, repo_id, 37);
-    priv->branch_name = g_strdup(branch_name);
+    priv->branch_name = g_strdup("master");
 
     priv->token = g_strdup(token);
+    priv->client_version = client_version;
 
     CcnetPeer *peer = ccnet_get_peer (seaf->ccnetrpc_client, processor->peer_id);
     if (!peer || !peer->session_key) {

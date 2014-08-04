@@ -557,15 +557,38 @@ def setup_build_env():
 
     must_mkdir(wix_temp_dir)
 
+def dependency_walk(applet):
+    output = os.path.join(conf[CONF_BUILDDIR], 'depends.csv')
+    cmd = 'depends.exe -c -f 1 -oc %s %s' % (output, applet)
+
+    # See the manual of Dependency walker
+    if run(cmd) > 0x100:
+        error('failed to run dependency walker for %s' % applet)
+
+    if not os.path.exists(output):
+        error('failed to run dependency walker for %s' % applet)
+
+    shared_libs = parse_depends_csv(output)
+    return shared_libs
+
 def parse_depends_csv(path):
     '''parse the output of dependency walker'''
-    libs = []
+    libs = set()
+    our_libs = ['libsearpc', 'libccnet', 'libseafile']
     def should_ignore_lib(lib):
+        lib = lib.lower()
         if not os.path.exists(lib):
             return True
 
-        if lib.lower().startswith('c:\\windows'):
+        if lib.startswith('c:\\windows'):
             return True
+
+        if lib.endswith('exe'):
+            return True
+
+        for name in our_libs:
+            if name in lib:
+                return True
 
         return False
 
@@ -576,11 +599,11 @@ def parse_depends_csv(path):
                 continue
             lib = row[1]
             if not should_ignore_lib(lib):
-                libs.append(lib)
+                libs.add(lib)
 
-    return libs
+    return set(libs)
 
-def copy_shared_libs():
+def copy_shared_libs(exes):
     '''Copy shared libs need by seafile-applet.exe, such as libccnet,
     libseafile, etc. First we use Dependency walker to analyse
     seafile-applet.exe, and get an output file in csv format. Then we parse
@@ -588,26 +611,14 @@ def copy_shared_libs():
 
     '''
 
-    output = os.path.join(conf[CONF_BUILDDIR], 'depends.csv')
-    applet = os.path.join(SeafileClient().projdir, 'seafile-applet.exe')
-    cmd = 'depends.exe -c -f 1 -oc %s %s' % (output, applet)
+    shared_libs = set()
+    for exectuable in exes:
+        shared_libs.update(dependency_walk(exectuable))
 
-    # See the manual of Dependency walker
-    if run(cmd) > 0x100:
-        error('failed to run dependency walker for seafile-applet.exe')
-
-    if not os.path.exists(output):
-        error('failed to run dependency walker for seafile-applet.exe')
-
-    shared_libs = parse_depends_csv(output)
     pack_bin_dir = os.path.join(conf[CONF_BUILDDIR], 'pack', 'bin')
     for lib in shared_libs:
         must_copy(lib, pack_bin_dir)
 
-    # libsqlite3 can not be found automatically
-    libsqlite3 = find_in_path('libsqlite3-0.dll')
-    must_copy(libsqlite3, pack_bin_dir)
-    # ssleay32
     ssleay32 = find_in_path('ssleay32.dll')
     must_copy(ssleay32, pack_bin_dir)
 
@@ -617,7 +628,6 @@ def copy_dll_exe():
 
     filelist = [
         os.path.join(prefix, 'bin', 'libsearpc-1.dll'),
-        os.path.join(prefix, 'bin', 'libsearpc-json-glib-0.dll'),
         os.path.join(prefix, 'bin', 'libccnet-0.dll'),
         os.path.join(prefix, 'bin', 'libseafile-0.dll'),
         os.path.join(prefix, 'bin', 'ccnet.exe'),
@@ -628,7 +638,7 @@ def copy_dll_exe():
     for name in filelist:
         must_copy(name, destdir)
 
-    copy_shared_libs()
+    copy_shared_libs([ f for f in filelist if f.endswith('.exe') ])
     copy_qt_plugins()
     copy_qt_translations()
 
@@ -649,16 +659,27 @@ def copy_qt_translations():
 
     qt_translation_dir = os.path.join(conf[CONF_QT_ROOT], 'translations')
 
-    langs = [
-        ('zh_CN', 'zh_CN'),
-        ('de', 'de_DE'),
-        ('fr', 'fr_FR'),
-        ('hu', 'hu_HU'),
-    ]
-    for lang in langs:
-        src = os.path.join(qt_translation_dir, 'qt_%s.qm' % lang[0])
-        dst = os.path.join(destdir, 'qt_%s.qm' % lang[1])
-        must_copy(src, dst)
+    i18n_dir = os.path.join(SeafileClient().projdir, 'i18n')
+    qm_pattern = os.path.join(i18n_dir, 'seafile_*.qm')
+
+    qt_qms = set()
+    def add_lang(lang):
+        if not lang:
+            return
+        qt_qm = os.path.join(qt_translation_dir, 'qt_%s.qm' % lang)
+        if os.path.exists(qt_qm):
+            qt_qms.add(qt_qm)
+        elif '_' in lang:
+            add_lang(lang[:lang.index('_')])
+
+    for fn in glob.glob(qm_pattern):
+        name = os.path.basename(fn)
+        m = re.match(r'seafile_(.*)\.qm', name)
+        lang = m.group(1)
+        add_lang(lang)
+
+    for src in qt_qms:
+        must_copy(src, destdir)
 
 def prepare_msi():
     pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
@@ -667,9 +688,6 @@ def prepare_msi():
 
     must_copytree(msi_dir, pack_dir)
     must_mkdir(os.path.join(pack_dir, 'bin'))
-
-    if run('make', cwd=os.path.join(pack_dir, 'custom')) != 0:
-        error('Error when compiling seafile msi custom dlls')
 
     copy_dll_exe()
 
@@ -725,6 +743,13 @@ def build_english_msi():
     if run('make en', cwd=pack_dir) != 0:
         error('Error when make seafile-en.msi')
 
+def build_german_msi():
+    '''The extra work to build the German msi.'''
+    pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
+
+    if run('make de', cwd=pack_dir) != 0:
+        error('Error when make seafile-de.msi')
+
 def move_msi():
     pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
     src_msi = os.path.join(pack_dir, 'seafile.msi')
@@ -737,12 +762,16 @@ def move_msi():
         src_msi_en = os.path.join(pack_dir, 'seafile-en.msi')
         dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-en.msi' % conf[CONF_VERSION])
         must_copy(src_msi_en, dst_msi_en)
+        src_msi_de = os.path.join(pack_dir, 'seafile-de.msi')
+        dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-de.msi' % conf[CONF_VERSION])
+        must_copy(src_msi_de, dst_msi_de)
 
     print '---------------------------------------------'
     print 'The build is successfully. Output is:'
     print '>>\t%s' % dst_msi
     if not conf[CONF_ONLY_CHINESE]:
         print '>>\t%s' % dst_msi_en
+        print '>>\t%s' % dst_msi_de
     print '---------------------------------------------'
 
 def check_tools():
@@ -782,6 +811,8 @@ def main():
     build_msi()
     if not conf[CONF_ONLY_CHINESE]:
         build_english_msi()
+        build_german_msi()
+
     move_msi()
 
 if __name__ == '__main__':

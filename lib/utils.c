@@ -42,6 +42,10 @@
 
 #include <jansson.h>
 
+#include <utime.h>
+
+#include <zlib.h>
+
 extern int inet_pton(int af, const char *src, void *dst);
 
 
@@ -261,6 +265,48 @@ get_utc_file_time_fd (int fd, __time64_t *mtime, __time64_t *ctime)
     return 0;
 }
 
+#define EPOCH_DIFF 11644473600ULL
+
+inline static void
+unix_time_to_file_time (guint64 unix_time, FILETIME *ftime)
+{
+    guint64 win_time;
+
+    win_time = (unix_time + EPOCH_DIFF) * 10000000;
+    ftime->dwLowDateTime = win_time & 0xFFFFFFFF;
+    ftime->dwHighDateTime = (win_time >> 32) & 0xFFFFFFFF;
+}
+
+static int
+set_utc_file_time (const char *path, const wchar_t *wpath, guint64 mtime)
+{
+    HANDLE handle;
+    FILETIME write_time;
+
+    handle = CreateFileW (wpath,
+                          GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                          NULL,
+                          OPEN_EXISTING,
+                          FILE_FLAG_BACKUP_SEMANTICS,
+                          NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        g_warning ("Failed to open %s: %lu.\n", path, GetLastError());
+        return -1;
+    }
+
+    unix_time_to_file_time (mtime, &write_time);
+
+    if (!SetFileTime (handle, NULL, NULL, &write_time)) {
+        g_warning ("Failed to set file time for %s: %lu.\n", path, GetLastError());
+        CloseHandle (handle);
+        return -1;
+    }
+    CloseHandle (handle);
+
+    return 0;
+}
+
 #endif
 
 int
@@ -299,6 +345,34 @@ seaf_fstat (int fd, SeafStat *st)
     return 0;
 #else
     return fstat (fd, st);
+#endif
+}
+
+int
+seaf_set_file_time (const char *path, guint64 mtime)
+{
+#ifndef WIN32
+    struct stat st;
+    struct utimbuf times;
+
+    if (stat (path, &st) < 0) {
+        g_warning ("Failed to stat %s: %s.\n", path, strerror(errno));
+        return -1;
+    }
+
+    times.actime = st.st_atime;
+    times.modtime = (time_t)mtime;
+
+    return utime (path, &times);
+#else
+    wchar_t *wpath = g_utf8_to_utf16 (path, -1, NULL, NULL, NULL);
+    int ret = 0;
+
+    if (set_utc_file_time (path, wpath, mtime) < 0)
+        ret = -1;
+
+    g_free (wpath);
+    return ret;
 #endif
 }
 
@@ -562,12 +636,15 @@ ccnet_expand_path (const char *src)
 
 
 int
-calculate_sha1 (unsigned char *sha1, const char *msg)
+calculate_sha1 (unsigned char *sha1, const char *msg, int len)
 {
     SHA_CTX c;
 
+    if (len < 0)
+        len = strlen(msg);
+
     SHA1_Init(&c);
-    SHA1_Update(&c, msg, strlen(msg));    
+    SHA1_Update(&c, msg, len);    
 	SHA1_Final(sha1, &c);
     return 0;
 }
@@ -674,11 +751,16 @@ char** strsplit_by_space (char *string, int *length)
     char **array;
     
     if (string == NULL || string[0] == '\0') {
-        *length = 0;
+        if (length != NULL) {
+          *length = 0;
+        }
         return NULL;
     }
 
     array = malloc (sizeof(char *) * size);
+    if (array == NULL) {
+      return NULL;
+    }
     
     remainder = string;
     while (!done) {
@@ -692,13 +774,21 @@ char** strsplit_by_space (char *string, int *length)
         array[num++] = remainder;
         if (!done && num == size) {
             size <<= 1;
-            array = realloc (array, sizeof(char *) * size);
+            char** tmp = realloc (array, sizeof(char *) * size);
+            if (tmp == NULL) {
+              free(array);
+              return NULL;
+            }
+            array = tmp;
         }
 
         remainder = s + 1;
     }
     
-    *length = num;
+    if (length != NULL) {
+      *length = num;
+    }
+
     return array;
 }
 
@@ -714,6 +804,9 @@ char** strsplit_by_char (char *string, int *length, char c)
     }
 
     array = malloc (sizeof(char *) * size);
+    if (array == NULL) {
+      return NULL;
+    }
     
     remainder = string;
     while (!done) {
@@ -727,13 +820,21 @@ char** strsplit_by_char (char *string, int *length, char c)
         array[num++] = remainder;
         if (!done && num == size) {
             size <<= 1;
-            array = realloc (array, sizeof(char *) * size);
+            char** tmp = realloc (array, sizeof(char *) * size);
+            if (tmp == NULL) {
+              free(array);
+              return NULL;
+            }
+            array = tmp;
         }
 
         remainder = s + 1;
     }
     
-    *length = num;
+    if (length != NULL) {
+      *length = num;
+    }
+
     return array;
 }
 
@@ -1045,7 +1146,7 @@ pgpipe (ccnet_pipe_t handles[2])
 
     if ( ( s = socket( AF_INET, SOCK_STREAM, 0 ) ) == INVALID_SOCKET )
     {
-        g_debug("pgpipe failed to create socket: %d\n", WSAGetLastError());
+        g_warning("pgpipe failed to create socket: %d\n", WSAGetLastError());
         return -1;
     }
 
@@ -1055,38 +1156,38 @@ pgpipe (ccnet_pipe_t handles[2])
     serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(s, (SOCKADDR *) & serv_addr, len) == SOCKET_ERROR)
     {
-        g_debug("pgpipe failed to bind: %d\n", WSAGetLastError());
+        g_warning("pgpipe failed to bind: %d\n", WSAGetLastError());
         closesocket(s);
         return -1;
     }
     if (listen(s, 1) == SOCKET_ERROR)
     {
-        g_debug("pgpipe failed to listen: %d\n", WSAGetLastError());
+        g_warning("pgpipe failed to listen: %d\n", WSAGetLastError());
         closesocket(s);
         return -1;
     }
     if (getsockname(s, (SOCKADDR *) & serv_addr, &len) == SOCKET_ERROR)
     {
-        g_debug("pgpipe failed to getsockname: %d\n", WSAGetLastError());
+        g_warning("pgpipe failed to getsockname: %d\n", WSAGetLastError());
         closesocket(s);
         return -1;
     }
     if ((handles[1] = socket(PF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
     {
-        g_debug("pgpipe failed to create socket 2: %d\n", WSAGetLastError());
+        g_warning("pgpipe failed to create socket 2: %d\n", WSAGetLastError());
         closesocket(s);
         return -1;
     }
 
     if (connect(handles[1], (SOCKADDR *) & serv_addr, len) == SOCKET_ERROR)
     {
-        g_debug("pgpipe failed to connect socket: %d\n", WSAGetLastError());
+        g_warning("pgpipe failed to connect socket: %d\n", WSAGetLastError());
         closesocket(s);
         return -1;
     }
     if ((handles[0] = accept(s, (SOCKADDR *) & serv_addr, &len)) == INVALID_SOCKET)
     {
-        g_debug("pgpipe failed to accept socket: %d\n", WSAGetLastError());
+        g_warning("pgpipe failed to accept socket: %d\n", WSAGetLastError());
         closesocket(handles[1]);
         handles[1] = INVALID_SOCKET;
         closesocket(s);
@@ -1900,4 +2001,125 @@ void
 json_object_set_int_member (json_t *object, const char *key, gint64 value)
 {
     json_object_set_new (object, key, json_integer (value));
+}
+
+void
+clean_utf8_data (char *data, int len)
+{
+    const char *s, *e;
+    char *p;
+    gboolean is_valid;
+
+    s = data;
+    p = data;
+
+    while ((s - data) != len) {
+        is_valid = g_utf8_validate (s, len - (s - data), &e);
+        if (is_valid)
+            break;
+
+        if (s != e)
+            p += (e - s);
+        *p = '?';
+        ++p;
+        s = e + 1;
+    }
+}
+
+/* zlib related wrapper functions. */
+
+#define ZLIB_BUF_SIZE 16384
+
+int
+seaf_compress (guint8 *input, int inlen, guint8 **output, int *outlen)
+{
+    int ret;
+    unsigned have;
+    z_stream strm;
+    guint8 out[ZLIB_BUF_SIZE];
+    GByteArray *barray;
+
+    /* allocate deflate state */
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    ret = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
+    if (ret != Z_OK) {
+        g_warning ("deflateInit failed.\n");
+        return -1;
+    }
+
+    strm.avail_in = inlen;
+    strm.next_in = input;
+    barray = g_byte_array_new ();
+
+    do {
+        strm.avail_out = ZLIB_BUF_SIZE;
+        strm.next_out = out;
+        ret = deflate(&strm, Z_FINISH);    /* no bad return value */
+        have = ZLIB_BUF_SIZE - strm.avail_out;
+        g_byte_array_append (barray, out, have);
+    } while (ret != Z_STREAM_END);
+
+    *outlen = barray->len;
+    *output = g_byte_array_free (barray, FALSE);
+
+    /* clean up and return */
+    (void)deflateEnd(&strm);
+    return 0;
+}
+
+int
+seaf_decompress (guint8 *input, int inlen, guint8 **output, int *outlen)
+{
+    int ret;
+    unsigned have;
+    z_stream strm;
+    unsigned char out[ZLIB_BUF_SIZE];
+    GByteArray *barray;
+
+    /* allocate inflate state */
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+    ret = inflateInit(&strm);
+    if (ret != Z_OK) {
+        g_warning ("inflateInit failed.\n");
+        return -1;
+    }
+
+    strm.avail_in = inlen;
+    strm.next_in = input;
+    barray = g_byte_array_new ();
+
+    do {
+        strm.avail_out = ZLIB_BUF_SIZE;
+        strm.next_out = out;
+        ret = inflate(&strm, Z_FINISH);
+        switch (ret) {
+        case Z_NEED_DICT:
+            ret = Z_DATA_ERROR;     /* and fall through */
+        case Z_DATA_ERROR:
+        case Z_MEM_ERROR:
+            g_warning ("Failed to inflate.\n");
+            goto out;
+        }
+        have = ZLIB_BUF_SIZE - strm.avail_out;
+        g_byte_array_append (barray, out, have);
+    } while (ret != Z_STREAM_END);
+
+out:
+    /* clean up and return */
+    (void)inflateEnd(&strm);
+
+    if (ret == Z_STREAM_END) {
+        *outlen = barray->len;
+        *output = g_byte_array_free (barray, FALSE);
+        return 0;
+    } else {
+        g_byte_array_free (barray, TRUE);
+        return -1;
+    }
 }

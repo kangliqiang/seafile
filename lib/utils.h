@@ -11,11 +11,20 @@
 #include <glib.h>
 #include <glib-object.h>
 #include <stdlib.h>
-#include <evutil.h>
 #include <sys/stat.h>
+
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#include <event2/util.h>
+#else
+#include <evutil.h>
+#endif
 
 #ifdef __linux__
 #include <endian.h>
+#endif
+
+#ifdef __OpenBSD__
+#include <machine/endian.h>
 #endif
 
 #ifdef WIN32
@@ -77,6 +86,8 @@ static inline int ccnet_rename(const char *oldfile, const char *newfile)
 int seaf_stat (const char *path, SeafStat *st);
 int seaf_fstat (int fd, SeafStat *st);
 
+int seaf_set_file_time (const char *path, guint64 mtime);
+
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
@@ -108,7 +119,8 @@ int hex_to_rawdata (const char *hex_str, unsigned char *rawdata, int n_bytes);
 #define sha1_to_hex(sha1, hex) rawdata_to_hex((sha1), (hex), 20)
 #define hex_to_sha1(hex, sha1) hex_to_rawdata((hex), (sha1), 20)
 
-int calculate_sha1 (unsigned char *sha1, const char *msg);
+/* If msg is NULL-terminated, set len to -1 */
+int calculate_sha1 (unsigned char *sha1, const char *msg, int len);
 int ccnet_sha1_equal (const void *v1, const void *v2);
 unsigned int ccnet_sha1_hash (const void *v);
 
@@ -325,5 +337,17 @@ json_object_set_string_member (json_t *object, const char *key, const char *valu
 
 void
 json_object_set_int_member (json_t *object, const char *key, gint64 value);
+
+/* Replace invalid UTF-8 bytes with '?' */
+void
+clean_utf8_data (char *data, int len);
+
+/* zlib related functions. */
+
+int
+seaf_compress (guint8 *input, int inlen, guint8 **output, int *outlen);
+
+int
+seaf_decompress (guint8 *input, int inlen, guint8 **output, int *outlen);
 
 #endif

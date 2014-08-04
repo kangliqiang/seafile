@@ -63,24 +63,24 @@ seaf_share_manager_add_share (SeafShareManager *mgr, const char *repo_id,
                               const char *from_email, const char *to_email,
                               const char *permission)
 {
-    char sql[512];
     gboolean db_err = FALSE;
     int ret = 0;
 
     char *from_email_l = g_ascii_strdown (from_email, -1);
     char *to_email_l = g_ascii_strdown (to_email, -1);
 
-    snprintf (sql, sizeof(sql),
-              "SELECT repo_id from SharedRepo WHERE repo_id='%s' AND "
-              "from_email='%s' AND to_email='%s'", repo_id, from_email_l,
-              to_email_l);
-    if (seaf_db_check_for_existence (mgr->seaf->db, sql, &db_err))
+    if (seaf_db_statement_exists (mgr->seaf->db,
+                                  "SELECT repo_id from SharedRepo "
+                                  "WHERE repo_id=? AND "
+                                  "from_email=? AND to_email=?",
+                                  &db_err, 3, "string", repo_id,
+                                  "string", from_email_l, "string", to_email_l))
         goto out;
 
-    snprintf (sql, sizeof(sql),
-              "INSERT INTO SharedRepo VALUES ('%s', '%s', '%s', '%s')", repo_id,
-              from_email_l, to_email_l, permission);
-    if (seaf_db_query (mgr->seaf->db, sql) < 0) {
+    if (seaf_db_statement_query (mgr->seaf->db,
+                                 "INSERT INTO SharedRepo VALUES (?, ?, ?, ?)",
+                                 4, "string", repo_id, "string", from_email_l,
+                                 "string", to_email_l, "string", permission) < 0) {
         ret = -1;
         goto out;
     }
@@ -96,17 +96,21 @@ seaf_share_manager_set_permission (SeafShareManager *mgr, const char *repo_id,
                                    const char *from_email, const char *to_email,
                                    const char *permission)
 {
-    char sql[512];
+    char *sql;
+    int ret;
 
     char *from_email_l = g_ascii_strdown (from_email, -1);
     char *to_email_l = g_ascii_strdown (to_email, -1);
-    snprintf (sql, sizeof(sql),
-              "UPDATE SharedRepo SET permission='%s' WHERE "
-              "repo_id='%s' AND from_email='%s' AND to_email='%s'",
-              permission, repo_id, from_email_l, to_email_l);
+    sql = "UPDATE SharedRepo SET permission=? WHERE "
+        "repo_id=? AND from_email=? AND to_email=?";
+
+    ret = seaf_db_statement_query (mgr->seaf->db, sql,
+                                   4, "string", permission, "string", repo_id,
+                                   "string", from_email_l, "string", to_email_l);
+
     g_free (from_email_l);
     g_free (to_email_l);
-    return seaf_db_query (mgr->seaf->db, sql);
+    return ret;
 }
 
 static gboolean
@@ -114,13 +118,24 @@ collect_repos (SeafDBRow *row, void *data)
 {
     GList **p_repos = data;
     const char *repo_id;
+    const char *vrepo_id;
     const char *email;
     const char *permission;
+    const char *commit_id;
     SeafileSharedRepo *srepo;
-    
+    SeafCommit *commit;
+
     repo_id = seaf_db_row_get_column_text (row, 0);
-    email = seaf_db_row_get_column_text (row, 1);
-    permission = seaf_db_row_get_column_text (row, 2);
+    vrepo_id = seaf_db_row_get_column_text (row, 1);
+    email = seaf_db_row_get_column_text (row, 2);
+    permission = seaf_db_row_get_column_text (row, 3);
+    commit_id = seaf_db_row_get_column_text (row, 4);
+
+    commit = seaf_commit_manager_get_commit_compatible (seaf->commit_mgr,
+                                                        repo_id,
+                                                        commit_id);
+    if (!commit)
+        return TRUE;
 
     char *email_l = g_ascii_strdown (email, -1);
 
@@ -129,42 +144,18 @@ collect_repos (SeafDBRow *row, void *data)
                           "repo_id", repo_id,
                           "user", email_l,
                           "permission", permission,
+                          "repo_name", commit->repo_name,
+                          "repo_desc", commit->repo_desc,
+                          "encrypted", commit->encrypted,
+                          "last_modified", commit->ctime,
+                          "is_virtual", (vrepo_id != NULL),
                           NULL);
     g_free (email_l);
+    seaf_commit_unref (commit);
+
     *p_repos = g_list_prepend (*p_repos, srepo);
 
     return TRUE;
-}
-
-static void
-fill_in_repo_info (GList *shared_repos)
-{
-    SeafileSharedRepo *srepo;
-    GList *ptr;
-    SeafRepo *repo = NULL;
-    SeafCommit *commit = NULL;
-
-    for (ptr = shared_repos; ptr; ptr = ptr->next) {
-        srepo = ptr->data;
-        repo = seaf_repo_manager_get_repo (seaf->repo_mgr,
-                                           seafile_shared_repo_get_repo_id(srepo));
-        if (!repo)
-            continue;
-        commit = seaf_commit_manager_get_commit (seaf->commit_mgr,
-                                                 repo->head->commit_id);
-        if (!commit) {
-            seaf_repo_unref (repo);
-            continue;
-        }
-        g_object_set (srepo,
-                      "repo_name", repo->name,
-                      "repo_desc", repo->desc,
-                      "encrypted", repo->encrypted,
-                      "last_modified", commit->ctime,
-                      NULL);
-        seaf_repo_unref (repo);
-        seaf_commit_unref (commit);
-    }
 }
 
 GList*
@@ -172,142 +163,79 @@ seaf_share_manager_list_share_repos (SeafShareManager *mgr, const char *email,
                                      const char *type, int start, int limit)
 {
     GList *ret = NULL, *p;
-    char sql[512];
+    char *sql;
 
     if (start == -1 && limit == -1) {
         if (g_strcmp0 (type, "from_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, to_email, permission FROM "
-                      "SharedRepo, RepoOwner "
-                      "WHERE from_email='%s' AND "
-                      "SharedRepo.repo_id=RepoOwner.repo_id",
-                      email);
+            sql = "SELECT SharedRepo.repo_id, VirtualRepo.repo_id, "
+                "to_email, permission, commit_id FROM "
+                "SharedRepo LEFT JOIN VirtualRepo ON "
+                "SharedRepo.repo_id=VirtualRepo.repo_id, Branch "
+                "WHERE from_email=? AND "
+                "SharedRepo.repo_id = Branch.repo_id AND "
+                "Branch.name = 'master'";
         } else if (g_strcmp0 (type, "to_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, from_email, permission FROM "
-                      "SharedRepo, RepoOwner "
-                      "WHERE to_email='%s' AND "
-                      "SharedRepo.repo_id=RepoOwner.repo_id",
-                      email);
+            sql = "SELECT SharedRepo.repo_id, NULL, "
+                "from_email, permission, commit_id FROM "
+                "SharedRepo, Branch "
+                "WHERE to_email=? AND "
+                "SharedRepo.repo_id = Branch.repo_id AND "
+                "Branch.name = 'master'";
         } else {
             /* should never reach here */
             g_warning ("[share mgr] Wrong column type");
+            return NULL;
+        }
+
+        if (seaf_db_statement_foreach_row (mgr->seaf->db, sql,
+                                           collect_repos, &ret,
+                                           1, "string", email) < 0) {
+            g_warning ("[share mgr] DB error when get shared repo id and email "
+                       "for %s.\n", email);
+            for (p = ret; p; p = p->next)
+                g_object_unref (p->data);
+            g_list_free (ret);
             return NULL;
         }
     }
     else {
         if (g_strcmp0 (type, "from_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, to_email, permission FROM "
-                      "SharedRepo, RepoOwner WHERE "
-                      "from_email='%s' AND "
-                      "SharedRepo.repo_id=RepoOwner.repo_id "
-                      "ORDER BY SharedRepo.repo_id "
-                      "LIMIT %d OFFSET %d",
-                      email, limit, start);
+            sql = "SELECT SharedRepo.repo_id, VirtualRepo.repo_id, "
+                "to_email, permission, commit_id FROM "
+                "SharedRepo LEFT JOIN VirtualRepo ON "
+                "SharedRepo.repo_id=VirtualRepo.repo_id, Branch "
+                "WHERE from_email=? "
+                "AND SharedRepo.repo_id = Branch.repo_id "
+                "AND Branch.name = 'master' "
+                "ORDER BY SharedRepo.repo_id "
+                "LIMIT ? OFFSET ?";
         } else if (g_strcmp0 (type, "to_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, from_email, permission FROM "
-                      "SharedRepo, RepoOwner WHERE "
-                      "to_email='%s' AND "
-                      "SharedRepo.repo_id=RepoOwner.repo_id "
-                      "ORDER BY SharedRepo.repo_id "
-                      "LIMIT %d OFFSET %d",
-                      email, limit, start);
+            sql = "SELECT SharedRepo.repo_id, NULL, "
+                "from_email, permission, commit_id FROM "
+                "SharedRepo, Branch WHERE "
+                "to_email=? "
+                "AND SharedRepo.repo_id = Branch.repo_id "
+                "AND Branch.name = 'master' "
+                "ORDER BY SharedRepo.repo_id "
+                "LIMIT ? OFFSET ?";
         } else {
             /* should never reach here */
             g_warning ("[share mgr] Wrong column type");
             return NULL;
         }
-    }
 
-    if (seaf_db_foreach_selected_row (mgr->seaf->db, sql,
-                                      collect_repos, &ret) < 0) {
-        g_warning ("[share mgr] DB error when get shared repo id and email "
-                   "for %s.\n", email);
-        for (p = ret; p; p = p->next)
-            g_object_unref (p->data);
-        g_list_free (ret);
-        return NULL;
-    }
-
-    fill_in_repo_info (ret);
-
-    return g_list_reverse (ret);
-}
-
-GList*
-seaf_share_manager_list_org_share_repos (SeafShareManager *mgr,
-                                         int org_id,
-                                         const char *email,
-                                         const char *type,
-                                         int start, int limit)
-{
-    GList *ret = NULL, *p;
-    char sql[512];
-
-    if (start == -1 && limit == -1) {
-        if (g_strcmp0 (type, "from_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, to_email, permission FROM "
-                      "SharedRepo, OrgRepo "
-                      "WHERE from_email='%s' AND "
-                      "OrgRepo.org_id=%d AND "
-                      "SharedRepo.repo_id=OrgRepo.repo_id",
-                      email, org_id);
-        } else if (g_strcmp0 (type, "to_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, from_email, permission FROM "
-                      "SharedRepo, OrgRepo "
-                      "WHERE to_email='%s' AND "
-                      "OrgRepo.org_id=%d AND "
-                      "SharedRepo.repo_id=OrgRepo.repo_id",
-                      email, org_id);
-        } else {
-            /* should never reach here */
-            g_warning ("[share mgr] Wrong column type");
+        if (seaf_db_statement_foreach_row (mgr->seaf->db, sql,
+                                           collect_repos, &ret,
+                                           3, "string", email,
+                                           "int", limit, "int", start) < 0) {
+            g_warning ("[share mgr] DB error when get shared repo id and email "
+                       "for %s.\n", email);
+            for (p = ret; p; p = p->next)
+                g_object_unref (p->data);
+            g_list_free (ret);
             return NULL;
         }
     }
-    else {
-        if (g_strcmp0 (type, "from_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, to_email, permission FROM "
-                      "SharedRepo, OrgRepo WHERE "
-                      "from_email='%s' AND "
-                      "OrgRepo.org_id=%d AND "
-                      "SharedRepo.repo_id=OrgRepo.repo_id "
-                      "ORDER BY SharedRepo.repo_id "
-                      "LIMIT %d OFFSET %d",
-                      email, org_id, limit, start);
-        } else if (g_strcmp0 (type, "to_email") == 0) {
-            snprintf (sql, sizeof(sql),
-                      "SELECT SharedRepo.repo_id, from_email, permission FROM "
-                      "SharedRepo, OrgRepo WHERE "
-                      "to_email='%s' AND "
-                      "OrgRepo.org_id=%d AND "
-                      "SharedRepo.repo_id=OrgRepo.repo_id "
-                      "ORDER BY SharedRepo.repo_id "
-                      "LIMIT %d OFFSET %d",
-                      email, org_id, limit, start);
-        } else {
-            /* should never reach here */
-            g_warning ("[share mgr] Wrong column type");
-            return NULL;
-        }
-    }
-
-    if (seaf_db_foreach_selected_row (mgr->seaf->db, sql,
-                                      collect_repos, &ret) < 0) {
-        g_warning ("[share mgr] DB error when get shared repo id and email "
-                   "for %s.\n", email);
-        for (p = ret; p; p = p->next)
-            g_object_unref (p->data);
-        g_list_free (ret);
-        return NULL;
-    }
-
-    fill_in_repo_info (ret);
 
     return g_list_reverse (ret);
 }
@@ -329,15 +257,14 @@ seaf_share_manager_list_shared_to (SeafShareManager *mgr,
                                    const char *owner,
                                    const char *repo_id)
 {
-    char sql[512];
+    char *sql;
     GList *ret = NULL;
 
-    snprintf (sql, sizeof(sql),
-              "SELECT to_email FROM SharedRepo WHERE "
-              "from_email='%s' AND repo_id='%s'",
-              owner, repo_id);
-    if (seaf_db_foreach_selected_row (mgr->seaf->db, sql,
-                                      collect_shared_to, &ret) < 0) {
+    sql = "SELECT to_email FROM SharedRepo WHERE "
+        "from_email=? AND repo_id=?";
+    if (seaf_db_statement_foreach_row (mgr->seaf->db, sql,
+                                       collect_shared_to, &ret,
+                                       2, "string", owner, "string", repo_id) < 0) {
         g_warning ("[share mgr] DB error when list shared to.\n");
         string_list_free (ret);
         return NULL;
@@ -350,13 +277,11 @@ int
 seaf_share_manager_remove_share (SeafShareManager *mgr, const char *repo_id,
                                  const char *from_email, const char *to_email)
 {
-    char sql[512];
-
-    snprintf (sql, sizeof(sql),
-              "DELETE FROM SharedRepo WHERE repo_id = '%s' AND from_email ="
-              " '%s' AND to_email = '%s'", repo_id, from_email, to_email);
-    
-    if (seaf_db_query (mgr->seaf->db, sql) < 0)
+    if (seaf_db_statement_query (mgr->seaf->db,
+                       "DELETE FROM SharedRepo WHERE repo_id = ? AND from_email ="
+                       " ? AND to_email = ?",
+                       3, "string", repo_id, "string", from_email,
+                       "string", to_email) < 0)
         return -1;
 
     return 0;
@@ -365,13 +290,9 @@ seaf_share_manager_remove_share (SeafShareManager *mgr, const char *repo_id,
 int
 seaf_share_manager_remove_repo (SeafShareManager *mgr, const char *repo_id)
 {
-    char sql[512];
-
-    snprintf (sql, sizeof(sql),
-              "DELETE FROM SharedRepo WHERE repo_id = '%s'", 
-              repo_id);
-    
-    if (seaf_db_query (mgr->seaf->db, sql) < 0)
+    if (seaf_db_statement_query (mgr->seaf->db,
+                       "DELETE FROM SharedRepo WHERE repo_id = ?",
+                       1, "string", repo_id) < 0)
         return -1;
 
     return 0;
@@ -382,10 +303,9 @@ seaf_share_manager_check_permission (SeafShareManager *mgr,
                                      const char *repo_id,
                                      const char *email)
 {
-    char sql[512];
+    char *sql;
 
-    snprintf (sql, sizeof(sql),
-              "SELECT permission FROM SharedRepo WHERE repo_id='%s' AND to_email='%s'",
-              repo_id, email);
-    return seaf_db_get_string (mgr->seaf->db, sql);
+    sql = "SELECT permission FROM SharedRepo WHERE repo_id=? AND to_email=?";
+    return seaf_db_statement_get_string (mgr->seaf->db, sql,
+                                         2, "string", repo_id, "string", email);
 }

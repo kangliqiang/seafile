@@ -20,6 +20,7 @@ static void add_entry(struct unpack_trees_options *o, struct cache_entry *ce,
     memcpy(new, ce, size);
     new->next = NULL;
     new->ce_flags = (new->ce_flags & ~clear) | set;
+    new->modifier = g_strdup(ce->modifier);
     add_index_entry(&o->result, new, ADD_CACHE_OK_TO_ADD|ADD_CACHE_OK_TO_REPLACE);
 }
 
@@ -247,6 +248,7 @@ static int traverse_trees_recursive(int n, unsigned long dirmask, unsigned long 
     struct tree_desc t[MAX_UNPACK_TREES];
     struct traverse_info newinfo;
     struct name_entry *p;
+    struct unpack_trees_options *o = info->data;
 
     p = names;
     while (!p->mode)
@@ -262,9 +264,9 @@ static int traverse_trees_recursive(int n, unsigned long dirmask, unsigned long 
         char root_id[41];
         if (dirmask & 1) {
             rawdata_to_hex(names[i].sha1, root_id, 20);
-            fill_tree_descriptor(t+i, root_id);
+            fill_tree_descriptor(o->repo_id, o->version, t+i, root_id);
         } else {
-            fill_tree_descriptor(t+i, NULL);
+            fill_tree_descriptor(o->repo_id, o->version, t+i, NULL);
         }
     }
 
@@ -348,6 +350,8 @@ static struct cache_entry *create_ce_entry(const struct traverse_info *info, con
     ce->ce_flags = create_ce_flags(len, stage);
     hashcpy(ce->sha1, n->sha1);
     make_traverse_path(ce->name, info, n);
+    ce->modifier = g_strdup(n->modifier);
+    ce->ce_mtime.sec = n->mtime;
 
     return ce;
 }
@@ -399,7 +403,7 @@ static int unpack_nondirectories(int n, unsigned long mask,
         int ret = call_unpack_fn(src, o);
         for (i = 1; i <= n; i++)
             if (src[i] && src[i] != o->df_conflict_entry) 
-                free(src[i]);
+                cache_entry_free(src[i]);
         return ret;
     }
 
@@ -650,6 +654,8 @@ int unpack_trees(unsigned len, struct tree_desc *t, struct unpack_trees_options 
 
     memset(&o->result, 0, sizeof(o->result));
     o->result.initialized = 1;
+    o->result.version = o->src_index->version;
+    o->result.has_modifier = o->src_index->has_modifier;
     o->result.timestamp.sec = o->src_index->timestamp.sec;
     o->result.timestamp.nsec = o->src_index->timestamp.nsec;
     o->merge_size = len;
@@ -740,7 +746,7 @@ static int verify_uptodate_1(struct cache_entry *ce,
 
     snprintf(full_path, SEAF_PATH_MAX, "%s/%s", o->base, ce->name);
     if (!seaf_stat (full_path, &st)) {
-        unsigned changed = ie_match_stat(o->src_index, ce, &st, CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE);
+        unsigned changed = ie_match_stat(ce, &st, CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE);
         if (!changed)
             return 0;
         /*
@@ -975,8 +981,7 @@ static int merged_entry(struct cache_entry *merge, struct cache_entry *old,
 
     /* We need timestamp when checking out the file later. */
     if (old) {
-        merge->ce_ctime = old->ce_ctime;
-        merge->ce_mtime = old->ce_mtime;
+        merge->current_mtime = old->ce_mtime.sec;
     }
 
     add_entry(o, merge, update, CE_STAGEMASK);
@@ -997,8 +1002,7 @@ static int deleted_entry(struct cache_entry *ce, struct cache_entry *old,
 
     /* We need timestamp when checking out the file later. */
     if (old) {
-        ce->ce_ctime = old->ce_ctime;
-        ce->ce_mtime = old->ce_mtime;
+        ce->current_mtime = old->ce_mtime.sec;
     }
 
     add_entry(o, ce, CE_REMOVE, CE_STAGEMASK);
@@ -1100,7 +1104,7 @@ int threeway_merge(struct cache_entry **stages, struct unpack_trees_options *o)
     if (head) {
         /* #5ALT, #15 */
         if (same(head, remote))
-            return merged_entry(head, index, o);
+            return merged_entry(remote, index, o);
         /* #13, #3ALT */
         if (!df_conflict_remote && remote_match && !head_match)
             return merged_entry(head, index, o);
@@ -1189,8 +1193,7 @@ int threeway_merge(struct cache_entry **stages, struct unpack_trees_options *o)
 
     /* We need ctime and mtime of index to handle worktree conflict later. */
     if (head && index) {
-        head->ce_ctime = index->ce_ctime;
-        head->ce_mtime = index->ce_mtime;
+        head->current_mtime = index->ce_mtime.sec;
     }
 
     if (head) { count += keep_entry(head, o); }
@@ -1295,7 +1298,7 @@ int oneway_merge(struct cache_entry **src, struct unpack_trees_options *o)
             char full_path[SEAF_PATH_MAX];
             snprintf (full_path, SEAF_PATH_MAX, "%s/%s", o->base, old->name);
             if (seaf_stat (full_path, &st) ||
-                ie_match_stat(o->src_index, old, &st, CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE))
+                ie_match_stat(old, &st, CE_MATCH_IGNORE_VALID|CE_MATCH_IGNORE_SKIP_WORKTREE))
                 update |= CE_UPDATE;
         }
         add_entry(o, old, update, 0);

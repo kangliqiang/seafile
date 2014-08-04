@@ -7,6 +7,7 @@ import os
 import time
 import re
 import shutil
+import glob
 import subprocess
 import hashlib
 import getpass
@@ -127,6 +128,14 @@ Press ENTER to continue
             os.mkdir(path)
         except OSError, e:
             Utils.error('failed to create directory %s:%s' % (path, e))
+
+    @staticmethod
+    def must_copy(src, dst):
+        '''Copy src to dst, exit on failure'''
+        try:
+            shutil.copy(src, dst)
+        except Exception, e:
+            Utils.error('failed to copy %s to %s: %s' % (src, dst, e))
 
     @staticmethod
     def find_in_path(prog):
@@ -810,12 +819,12 @@ class SeafileConfigurator(AbstractConfigurator):
         AbstractConfigurator.__init__(self)
         self.seafile_dir = os.path.join(env_mgr.top_dir, 'seafile-data')
         self.port = 12001
-        self.httpserver_port = 8082
+        self.fileserver_port = 8082
 
     def ask_questions(self):
         self.ask_seafile_dir()
         self.ask_port()
-        self.ask_httpserver_port()
+        self.ask_fileserver_port()
 
     def generate(self):
         print 'Generating seafile configuration ...\n'
@@ -824,7 +833,7 @@ class SeafileConfigurator(AbstractConfigurator):
             seafserv_init,
             '--seafile-dir', self.seafile_dir,
             '--port', str(self.port),
-            '--httpserver-port', str(self.httpserver_port),
+            '--fileserver-port', str(self.fileserver_port),
         ]
 
         if Utils.run_argv(argv, env=env_mgr.get_binary_env()) != 0:
@@ -890,7 +899,7 @@ class SeafileConfigurator(AbstractConfigurator):
                                        default=default,
                                        validate=validate)
 
-    def ask_httpserver_port(self):
+    def ask_fileserver_port(self):
         def validate(port):
             port = Utils.validate_port(port)
             if port == ccnet_config.port:
@@ -903,10 +912,10 @@ class SeafileConfigurator(AbstractConfigurator):
 
             return port
 
-        question = 'Which port do you want to use for the seafile httpserver?'
-        key = 'seafile httpserver port'
+        question = 'Which port do you want to use for the seafile fileserver?'
+        key = 'seafile fileserver port'
         default = 8082
-        self.httpserver_port = Utils.ask_question(question,
+        self.fileserver_port = Utils.ask_question(question,
                                             key=key,
                                             default=default,
                                             validate=validate)
@@ -926,8 +935,9 @@ class SeahubConfigurator(AbstractConfigurator):
         return hashlib.sha1(self.admin_password).hexdigest() # pylint: disable=E1101
 
     def ask_questions(self):
-        self.ask_admin_email()
-        self.ask_admin_password()
+        pass
+        # self.ask_admin_email()
+        # self.ask_admin_password()
 
     def generate(self):
         '''Generating seahub_settings.py'''
@@ -939,7 +949,7 @@ class SeahubConfigurator(AbstractConfigurator):
             self.write_database_config(fp)
 
     def write_secret_key(self, fp):
-        text = 'SECREC_KEY = "%s"\n\n' % self.gen_secret_key()
+        text = 'SECRET_KEY = "%s"\n\n' % self.gen_secret_key()
         fp.write(text)
 
     def write_database_config(self, fp):
@@ -1056,6 +1066,46 @@ DATABASES = {
         except Exception, e:
             Utils.error('Failed to prepare seahub avatars dir: %s' % e)
 
+class SeafDavConfigurator(AbstractConfigurator):
+    def __init__(self):
+        AbstractConfigurator.__init__(self)
+        self.conf_dir = None
+        self.seafdav_conf = None
+
+    def ask_questions(self):
+        pass
+
+    def generate(self):
+        self.conf_dir = os.path.join(env_mgr.top_dir, 'conf')
+        if not os.path.exists('conf'):
+            Utils.must_mkdir(self.conf_dir)
+
+        self.seafdav_conf = os.path.join(self.conf_dir, 'seafdav.conf')
+        text = '''
+[WEBDAV]
+enabled = false
+port = 8080
+fastcgi = false
+share_name = /
+'''
+
+        with open(self.seafdav_conf, 'w') as fp:
+            fp.write(text)
+
+class UserManualHandler(object):
+    def __init__(self):
+        self.src_docs_dir = os.path.join(env_mgr.install_path, 'seafile', 'docs')
+        self.library_template_dir = None
+
+    def copy_user_manuals(self):
+        self.library_template_dir = os.path.join(seafile_config.seafile_dir, 'library-template')
+        Utils.must_mkdir(self.library_template_dir)
+
+        pattern = os.path.join(self.src_docs_dir, '*.doc')
+
+        for doc in glob.glob(pattern):
+            Utils.must_copy(doc, self.library_template_dir)
+
 def report_config():
     print
     print '---------------------------------'
@@ -1070,10 +1120,7 @@ def report_config():
 
     seafile data dir:       %(seafile_dir)s
     seafile port:           %(seafile_port)s
-    httpserver port:        %(httpserver_port)s
-
-    admin email:            %(admin_email)s
-    admin password:         ******
+    fileserver port:        %(fileserver_port)s
 
     database:               %(use_existing_db)s
     ccnet database:         %(ccnet_db_name)s
@@ -1089,7 +1136,7 @@ def report_config():
 
         'seafile_dir' :         seafile_config.seafile_dir,
         'seafile_port' :        seafile_config.port,
-        'httpserver_port' :     seafile_config.httpserver_port,
+        'fileserver_port' :     seafile_config.fileserver_port,
 
         'admin_email' :         seahub_config.admin_email,
 
@@ -1125,7 +1172,9 @@ def create_seafile_server_symlink():
 env_mgr = EnvManager()
 ccnet_config = CcnetConfigurator()
 seafile_config = SeafileConfigurator()
+seafdav_config = SeafDavConfigurator()
 seahub_config = SeahubConfigurator()
+user_manuals_handler = UserManualHandler()
 # Would be created after AbstractDBConfigurator.ask_use_existing_db()
 db_config = None
 
@@ -1155,11 +1204,13 @@ def main():
     db_config.generate()
     ccnet_config.generate()
     seafile_config.generate()
+    seafdav_config.generate()
     seahub_config.generate()
 
     seahub_config.do_syncdb()
     seahub_config.prepare_avatar_dir()
-    db_config.create_seahub_admin()
+    # db_config.create_seahub_admin()
+    user_manuals_handler.copy_user_manuals()
     create_seafile_server_symlink()
 
     report_success()
@@ -1181,7 +1232,7 @@ If you are behind a firewall, remember to allow input/output of these tcp ports:
 
 port of ccnet server:         %(ccnet_port)s
 port of seafile server:       %(seafile_port)s
-port of seafile httpserver:   %(httpserver_port)s
+port of seafile fileserver:   %(fileserver_port)s
 port of seahub:               8000
 
 When problems occur, Refer to
@@ -1194,7 +1245,7 @@ for information.
 
     print message % dict(ccnet_port=ccnet_config.port,
                          seafile_port=seafile_config.port,
-                         httpserver_port=seafile_config.httpserver_port,
+                         fileserver_port=seafile_config.fileserver_port,
                          server_manual_http=SERVER_MANUAL_HTTP)
 
 

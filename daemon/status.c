@@ -203,31 +203,6 @@ void wt_status_collect_untracked(struct index_state *index,
     free(dir.entries);
 }
 
-#if 0
-static gboolean
-is_empty_dir (const char *path, IgnoreFunc should_ignore)
-{
-    GDir *dir;
-    const char *dname;
-
-    dir = g_dir_open (path, 0, NULL);
-    if (!dir) {
-        g_warning ("Failed to open dir %s: %s.\n", path, strerror(errno));
-        return FALSE;
-    }
-
-    int n = 0;
-    while ((dname = g_dir_read_name(dir)) != NULL) {
-        if (should_ignore(dname, NULL))
-            continue;
-        ++n;
-    }
-    g_dir_close (dir);
-
-    return (n == 0);
-}
-#endif
-
 void wt_status_collect_changes_worktree(struct index_state *index,
                                         GList **results,
                                         const char *worktree)
@@ -289,7 +264,7 @@ void wt_status_collect_changes_worktree(struct index_state *index,
                 continue;
             }
 
-            if (ce->ce_mtime.sec == 0) {
+            if (ce->ce_ctime.sec == 0) {
                 g_free (realpath);
                 continue;
             }
@@ -318,7 +293,7 @@ void wt_status_collect_changes_worktree(struct index_state *index,
 
         g_free (realpath);
 
-        changed = ie_match_stat (index, ce, &st, 0);
+        changed = ie_match_stat (ce, &st, 0);
         if (!changed) {
             ce_mark_uptodate (ce);
             continue;
@@ -356,7 +331,8 @@ wt_status_collect_changes_index (struct index_state *index,
 
     fs_mgr = repo->manager->seaf->fs_mgr;
     head = seaf_commit_manager_get_commit (seaf->commit_mgr,
-            repo->head->commit_id);
+                                           repo->id, repo->version,
+                                           repo->head->commit_id);
     if (!head) {
         seaf_warning ("Failed to get commit %s.\n", repo->head->commit_id);
         return;
@@ -369,14 +345,17 @@ wt_status_collect_changes_index (struct index_state *index,
         SeafDir *root;
 
         /* call diff_index to get status */
-        root = seaf_fs_manager_get_seafdir (fs_mgr, head->root_id);
+        root = seaf_fs_manager_get_seafdir (fs_mgr,
+                                            repo->id,
+                                            repo->version,
+                                            head->root_id);
         if (!root) {
             seaf_warning ("Failed to get root %s.\n", head->root_id);
             seaf_commit_unref (head);
             return;
         }
 
-        if (diff_index(index, root, results) < 0)
+        if (diff_index(repo->id, repo->version, index, root, results) < 0)
             g_warning("diff index failed\n");
         seaf_dir_free (root);
         seaf_commit_unref (head);

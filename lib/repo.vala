@@ -70,6 +70,11 @@ public class Repo : Object {
     public string origin_path { get; set; }
     public bool is_original_owner { get; set; }
     public string virtual_perm { get; set; }
+
+    // data format version
+    public int version { get; set; }
+    // Used to access fs objects
+    public string store_id { get; set; }
 }
 
 
@@ -125,6 +130,7 @@ public class SharedRepo : Object {
     public int group_id { get; set; } // used when shared to group
 
     public int last_modified { get; set; }
+    public bool is_virtual { get; set; }
 }
 
 public class DiffEntry : Object {

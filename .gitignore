@@ -69,6 +69,7 @@ lib/branch.c
 lib/commit.c
 lib/crypt.c
 lib/repo.c
+lib/copy-task.c
 app/seafile
 app/seafserv-tool
 daemon/seaf-daemon
@@ -77,7 +78,7 @@ server/seaf-server
 server/gc/seafserv-gc
 monitor/seaf-mon
 controller/seafile-controller
-httpserver/httpserver
+fileserver/fileserver
 tests/common-conf.sh
 tools/seaf-server-init
 *.mo
@@ -119,3 +120,5 @@ tests/test-seafile-fmt
 *.pc
 seaf-fsck
 *.tar.gz
+fuse/seaf-fuse
+server/gc/seaf-migrate

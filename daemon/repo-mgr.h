@@ -26,6 +26,7 @@
 #define REPO_PROP_RELAY_ADDR  "relay-address"
 #define REPO_PROP_RELAY_PORT  "relay-port"
 #define REPO_ENCRYPTED 0x1
+#define REPO_PROP_DOWNLOAD_HEAD "download-head"
 
 struct _SeafRepoManager;
 typedef struct _SeafRepo SeafRepo;
@@ -69,6 +70,10 @@ struct _SeafRepo {
     unsigned int  net_browsable : 1;
     unsigned int  quota_full_notified : 1;
     unsigned int  access_denied_notified : 1;
+
+    int version;
+
+    gboolean create_partial_commit;
 };
 
 
@@ -82,6 +87,9 @@ seaf_repo_free (SeafRepo *repo);
 
 int
 seaf_repo_set_head (SeafRepo *repo, SeafBranch *branch);
+
+SeafCommit *
+seaf_repo_get_head_commit (const char *repo_id);
 
 int
 seaf_repo_checkdir (SeafRepo *repo);
@@ -108,6 +116,8 @@ seaf_repo_index_add (SeafRepo *repo, const char *path);
 
 int
 seaf_repo_index_worktree_files (const char *repo_id,
+                                int version,
+                                const char *modifier,
                                 const char *worktree,
                                 const char *passwd,
                                 int enc_version,
@@ -127,7 +137,8 @@ gboolean
 seaf_repo_is_index_unmerged (SeafRepo *repo);
 
 char *
-seaf_repo_index_commit (SeafRepo *repo, const char *desc, GError **error);
+seaf_repo_index_commit (SeafRepo *repo, const char *desc, gboolean is_initial_commit,
+                        GError **error);
 
 int
 seaf_repo_checkout (SeafRepo *repo, const char *worktree_parent, char **error);
@@ -142,9 +153,16 @@ int
 seaf_repo_checkout_commit (SeafRepo *repo, SeafCommit *commit, gboolean recover_merge,
                            char **error);
 
+enum {
+    MERGE_STATUS_UNKNOWN = 0,
+    MERGE_STATUS_UPTODATE,
+    MERGE_STATUS_FAST_FORWARD,
+    MERGE_STATUS_REAL_MERGE,
+};
+
 int
 seaf_repo_merge (SeafRepo *repo, const char *branch, char **error,
-                 gboolean *real_merge);
+                 int *merge_status);
 
 GList *
 seaf_repo_diff (SeafRepo *repo, const char *arg1, const char *arg2, char **error);
@@ -179,7 +197,8 @@ int
 seaf_repo_manager_del_repo (SeafRepoManager *mgr, SeafRepo *repo);
 
 void
-seaf_repo_manager_remove_repo_ondisk (SeafRepoManager *mgr, const char *repo_id);
+seaf_repo_manager_remove_repo_ondisk (SeafRepoManager *mgr, const char *repo_id,
+                                      gboolean add_deleted_record);
 
 SeafRepo* 
 seaf_repo_manager_create_new_repo (SeafRepoManager *mgr,
@@ -200,6 +219,12 @@ seaf_repo_manager_repo_exists_prefix (SeafRepoManager *manager, const gchar *id)
 
 GList* 
 seaf_repo_manager_get_repo_list (SeafRepoManager *mgr, int start, int limit);
+
+GList *
+seaf_repo_manager_list_garbage_repos (SeafRepoManager *mgr);
+
+void
+seaf_repo_manager_remove_garbage_repo (SeafRepoManager *mgr, const char *repo_id);
 
 #define MAX_REPO_TOKEN 64
 #define DEFAULT_REPO_TOKEN "default"
@@ -310,6 +335,19 @@ int
 seaf_repo_manager_get_merge_info (SeafRepoManager *manager,
                                   const char *repo_id,
                                   SeafRepoMergeInfo *info);
+
+int
+seaf_repo_manager_get_common_ancestor (SeafRepoManager *manager,
+                                       const char *repo_id,
+                                       char *common_ancestor,
+                                       char *head_id);
+
+int
+seaf_repo_manager_set_common_ancestor (SeafRepoManager *manager,
+                                       const char *repo_id,
+                                       const char *common_ancestor,
+                                       const char *head_id);
+
 typedef struct {
     char repo_id[41];
     char worktree[SEAF_PATH_MAX];
@@ -353,5 +391,17 @@ seaf_repo_check_ignore_file (GList *ignore_list, const char *fullpath);
 
 void
 seaf_repo_free_ignore_files (GList *ignore_list);
+
+enum {
+    FETCH_CHECKOUT_SUCCESS = 0,
+    FETCH_CHECKOUT_CANCELED,
+    FETCH_CHECKOUT_FAILED,
+};
+
+struct _TransferTask;
+
+int
+seaf_repo_fetch_and_checkout (struct _TransferTask *task,
+                              const char *remote_head_id);
 
 #endif

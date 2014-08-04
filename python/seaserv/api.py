@@ -16,9 +16,9 @@ class SeafileAPI(object):
     def __init__(self):
         pass
 
-    # httpserver token
-    def get_httpserver_access_token(self, repo_id, obj_id, op, username):
-        """Generate token for access file/dir in httpserver
+    # fileserver token
+    def get_fileserver_access_token(self, repo_id, obj_id, op, username):
+        """Generate token for access file/dir in fileserver
 
         op: the operation, 'view', 'download', 'download-dir'
 
@@ -26,7 +26,7 @@ class SeafileAPI(object):
         """
         return seafserv_rpc.web_get_access_token(repo_id, obj_id, op, username)
 
-    def query_httpserver_access_token(self, token):
+    def query_fileserver_access_token(self, token):
         """Get the WebAccess object
 
         token: the access token in string
@@ -118,16 +118,22 @@ class SeafileAPI(object):
         return seafserv_threaded_rpc.del_file(repo_id, parent_dir, filename, username)
 
     def copy_file(self, src_repo, src_dir, src_filename, dst_repo,
-                  dst_dir, dst_filename, username):
+                  dst_dir, dst_filename, username, need_progress, synchronous=0):
         return seafserv_threaded_rpc.copy_file(src_repo, src_dir, src_filename,
                                                dst_repo, dst_dir, dst_filename,
-                                               username)
+                                               username, need_progress, synchronous)
 
     def move_file(self, src_repo, src_dir, src_filename, dst_repo, dst_dir,
-                  dst_filename, username):
+                  dst_filename, username, need_progress, synchronous=0):
         return seafserv_threaded_rpc.move_file(src_repo, src_dir, src_filename,
                                                dst_repo, dst_dir, dst_filename,
-                                               username)
+                                               username, need_progress, synchronous)
+
+    def get_copy_task(self, task_id):
+        return seafserv_rpc.get_copy_task(task_id)
+
+    def cancel_copy_task(self, task_id):
+        return seafserv_rpc.cancel_copy_task(task_id)
     
     def rename_file(self, repo_id, parent_dir, oldname, newname, username):
         return seafserv_threaded_rpc.rename_file(repo_id, parent_dir,
@@ -136,14 +142,15 @@ class SeafileAPI(object):
     def is_valid_filename(self, repo_id, filename):
         return seafserv_threaded_rpc.is_valid_filename(repo_id, filename)
 
-    def get_file_size(self, file_id):
-        return seafserv_threaded_rpc.get_file_size(file_id)
+    def get_file_size(self, store_id, version, file_id):
+        return seafserv_threaded_rpc.get_file_size(store_id, version, file_id)
 
     def get_file_id_by_path(self, repo_id, path):
         return seafserv_threaded_rpc.get_file_id_by_path(repo_id, path)
 
-    def get_file_id_by_commit_and_path(self, commit_id, path):
-        return seafserv_threaded_rpc.get_file_id_by_commit_and_path(commit_id, path)
+    def get_file_id_by_commit_and_path(self, repo_id, commit_id, path):
+        return seafserv_threaded_rpc.get_file_id_by_commit_and_path(repo_id,
+                                                                    commit_id, path)
 
     def get_file_revisions(self, repo_id, path, max_revision, limit):
         return seafserv_threaded_rpc.list_file_revisions(repo_id, path,
@@ -161,25 +168,26 @@ class SeafileAPI(object):
         """Add a directory"""
         return seafserv_threaded_rpc.post_dir(repo_id, parent_dir, dirname, username)
 
-    def list_file_by_file_id(self, file_id, offset=-1, limit=-1):
-        return seafserv_threaded_rpc.list_file(file_id, offset, limit)
+    def list_file_by_file_id(self, repo_id, file_id, offset=-1, limit=-1):
+        return seafserv_threaded_rpc.list_file(repo_id, file_id, offset, limit)
     
     def get_dir_id_by_path(self, repo_id, path):
         return seafserv_threaded_rpc.get_dir_id_by_path(repo_id, path)
     
-    def list_dir_by_dir_id(self, dir_id, offset=-1, limit=-1):
-        return seafserv_threaded_rpc.list_dir(dir_id, offset, limit)
+    def list_dir_by_dir_id(self, repo_id, dir_id, offset=-1, limit=-1):
+        return seafserv_threaded_rpc.list_dir(repo_id, dir_id, offset, limit)
 
     def list_dir_by_path(self, repo_id, path, offset=-1, limit=-1):
         dir_id = seafserv_threaded_rpc.get_dir_id_by_path(repo_id, path)
-        return seafserv_threaded_rpc.list_dir(dir_id, offset, limit)
+        return seafserv_threaded_rpc.list_dir(repo_id, dir_id, offset, limit)
 
-    def list_dir_by_commit_and_path(self, commit_id, path, offset=-1, limit=-1):
-        dir_id = seafserv_threaded_rpc.get_dirid_by_path(commit_id, path)
-        return seafserv_threaded_rpc.list_dir(dir_id, offset, limit)
+    def list_dir_by_commit_and_path(self, repo_id,
+                                    commit_id, path, offset=-1, limit=-1):
+        dir_id = seafserv_threaded_rpc.get_dirid_by_path(repo_id, commit_id, path)
+        return seafserv_threaded_rpc.list_dir(repo_id, dir_id, offset, limit)
     
-    def get_dir_id_by_commit_and_path(self, commit_id, path):
-        return seafserv_threaded_rpc.get_dirid_by_path(commit_id, path)
+    def get_dir_id_by_commit_and_path(self, repo_id, commit_id, path):
+        return seafserv_threaded_rpc.get_dirid_by_path(repo_id, commit_id, path)
 
     def revert_file(self, repo_id, commit_id, path, username):
         return seafserv_threaded_rpc.revert_file(repo_id, commit_id, path, username)
@@ -213,10 +221,19 @@ class SeafileAPI(object):
 
     # share repo to group
     def group_share_repo(self, repo_id, group_id, username, permission):
+        # deprecated, use ``set_group_repo``
+        return seafserv_threaded_rpc.group_share_repo(repo_id, group_id,
+                                                      username, permission)
+
+    def set_group_repo(self, repo_id, group_id, username, permission):
         return seafserv_threaded_rpc.group_share_repo(repo_id, group_id,
                                                       username, permission)
 
     def group_unshare_repo(self, repo_id, group_id, username):
+        # deprecated, use ``unset_group_repo``
+        return seafserv_threaded_rpc.group_unshare_repo(repo_id, group_id, username)
+
+    def unset_group_repo(self, repo_id, group_id, username):
         return seafserv_threaded_rpc.group_unshare_repo(repo_id, group_id, username)
 
     def get_shared_groups_by_repo(self, repo_id):
@@ -311,6 +328,10 @@ class SeafileAPI(object):
         return seafserv_threaded_rpc.is_inner_pub_repo(repo_id)
 
 
+    # permission
+    def check_permission(self, repo_id, user):
+        return seafserv_threaded_rpc.check_permission(repo_id, user)
+
     # virtual repo
     def create_virtual_repo(self, origin_repo_id, path, repo_name, repo_desc, owner):
         return seafserv_threaded_rpc.create_virtual_repo(origin_repo_id,
@@ -325,5 +346,12 @@ class SeafileAPI(object):
     # @path must begin with '/', e.g. '/example'
     def get_virtual_repo(self, origin_repo, path, owner):
         return seafserv_threaded_rpc.get_virtual_repo(origin_repo, path, owner)
+
+    def change_repo_passwd(self, repo_id, old_passwd, new_passwd, user):
+        return seafserv_threaded_rpc.change_repo_passwd(repo_id, old_passwd,
+                                                        new_passwd, user)
+
+    def delete_repo_tokens_by_peer_id(self, username, device_id):
+        return seafserv_threaded_rpc.delete_repo_tokens_by_peer_id(username, device_id)
 
 seafile_api = SeafileAPI()

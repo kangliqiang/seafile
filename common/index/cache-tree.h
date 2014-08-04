@@ -16,11 +16,14 @@ struct cache_tree {
     unsigned char sha1[20];
     int subtree_nr;
     int subtree_alloc;
+    guint64 mtime;
     struct cache_tree_sub **down;
 };
 
-typedef int (*CommitCB) (struct cache_tree *,
-        struct cache_entry **, int, const char *, int);
+typedef int (*CommitCB) (const char *, int,
+                         const char *,
+                         struct cache_tree *,
+                         struct cache_entry **, int, const char *, int);
 struct cache_tree_sub *cache_tree_find_subtree(struct cache_tree *,
                                                const char *, int, int);
 
@@ -33,7 +36,9 @@ struct cache_tree_sub *cache_tree_sub(struct cache_tree *, const char *);
 /* struct cache_tree *cache_tree_read(const char *buffer, unsigned long size); */
 
 int cache_tree_fully_valid(struct cache_tree *);
-int cache_tree_update(struct cache_tree *, struct cache_entry **, int, int, int, CommitCB);
+int cache_tree_update(const char *repo_id, int version,
+                      const char *worktree,
+                      struct cache_tree *, struct cache_entry **, int, int, int, CommitCB);
 
 /* bitmasks to write_cache_as_tree flags */
 #define WRITE_TREE_MISSING_OK 1

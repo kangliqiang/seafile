@@ -50,6 +50,12 @@ typedef struct  {
     guint32  reader_id;
     guint32  writer_id;
     guint32  stat_id;
+
+    /* Used for getting repo info */
+    char        repo_id[37];
+    char        store_id[37];
+    int         repo_version;
+    gboolean    success;
 } SeafileRecvfsProcPriv;
 
 #define GET_PRIV(o)  \
@@ -222,7 +228,8 @@ on_seafdir_read (OSAsyncResult *res, void *cb_data)
     seaf_debug ("[recvfs] Read seafdir %s.\n", res->obj_id);
 #endif
 
-    dir = seaf_dir_from_data (res->obj_id, res->data, res->len);
+    dir = seaf_dir_from_data (res->obj_id, res->data, res->len,
+                              (priv->repo_version > 0));
     if (!dir) {
         g_warning ("[recvfs] Corrupt dir object %s.\n", res->obj_id);
         request_object_batch (processor, priv, res->obj_id);
@@ -255,6 +262,7 @@ static void
 on_fs_write (OSAsyncResult *res, void *cb_data)
 {
     CcnetProcessor *processor = cb_data;
+    USE_PRIV;
 
     if (!res->success) {
         g_warning ("[recvfs] Failed to write %s.\n", res->obj_id);
@@ -263,6 +271,8 @@ on_fs_write (OSAsyncResult *res, void *cb_data)
         ccnet_processor_done (processor, FALSE);
         return;
     }
+
+    --priv->pending_objects;
 
 #ifdef DEBUG
     seaf_debug ("[recvfs] Wrote fs object %s.\n", res->obj_id);
@@ -323,14 +333,60 @@ register_async_io (CcnetProcessor *processor)
 
     priv->registered = TRUE;
     priv->reader_id = seaf_obj_store_register_async_read (seaf->fs_mgr->obj_store,
+                                                          priv->store_id,
+                                                          priv->repo_version,
                                                           on_seafdir_read,
                                                           processor);
     priv->stat_id = seaf_obj_store_register_async_stat (seaf->fs_mgr->obj_store,
-                                                          on_seafile_stat,
-                                                          processor);
+                                                        priv->store_id,
+                                                        priv->repo_version,
+                                                        on_seafile_stat,
+                                                        processor);
     priv->writer_id = seaf_obj_store_register_async_write (seaf->fs_mgr->obj_store,
+                                                           priv->store_id,
+                                                           priv->repo_version,
                                                            on_fs_write,
                                                            processor);
+}
+
+static void *
+get_repo_info_thread (void *data)
+{
+    CcnetProcessor *processor = data;
+    USE_PRIV;
+    SeafRepo *repo;
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, priv->repo_id);
+    if (!repo) {
+        seaf_warning ("Failed to get repo %s.\n", priv->repo_id);
+        priv->success = FALSE;
+        return data;
+    }
+
+    memcpy (priv->store_id, repo->store_id, 36);
+    priv->repo_version = repo->version;
+    priv->success = TRUE;
+
+    seaf_repo_unref (repo);
+    return data;
+}
+
+static void
+get_repo_info_done (void *data)
+{
+    CcnetProcessor *processor = data;
+    USE_PRIV;
+
+    if (priv->success) {
+        ccnet_processor_send_response (processor, SC_OK, SS_OK, NULL, 0);
+        processor->state = RECV_ROOT;
+        priv->dir_queue = g_queue_new ();
+        register_async_io (processor);
+    } else {
+        ccnet_processor_send_response (processor, SC_SHUTDOWN, SS_SHUTDOWN,
+                                       NULL, 0);
+        ccnet_processor_done (processor, FALSE);
+    }
 }
 
 static int
@@ -349,11 +405,12 @@ start (CcnetProcessor *processor, int argc, char **argv)
     if (seaf_token_manager_verify_token (seaf->token_mgr,
                                          NULL,
                                          processor->peer_id,
-                                         session_token, NULL) == 0) {
-        ccnet_processor_send_response (processor, SC_OK, SS_OK, NULL, 0);
-        processor->state = RECV_ROOT;
-        priv->dir_queue = g_queue_new ();
-        register_async_io (processor);
+                                         session_token, priv->repo_id) == 0) {
+        ccnet_processor_thread_create (processor,
+                                       seaf->job_mgr,
+                                       get_repo_info_thread,
+                                       get_repo_info_done,
+                                       processor);
         return 0;
     } else {
         ccnet_processor_send_response (processor, 
@@ -382,7 +439,7 @@ recv_fs_object (CcnetProcessor *processor, char *content, int clen)
 {
     USE_PRIV;
     ObjectPack *pack = (ObjectPack *)content;
-    uint32_t type;
+    SeafFSObject *fs_obj = NULL;
 
     if (clen < sizeof(ObjectPack)) {
         g_warning ("invalid object id.\n");
@@ -391,21 +448,20 @@ recv_fs_object (CcnetProcessor *processor, char *content, int clen)
 
     seaf_debug ("[recvfs] Recv fs object %.8s.\n", pack->id);
 
-    --priv->pending_objects;
+    fs_obj = seaf_fs_object_from_data(pack->id,
+                                      pack->object, clen - sizeof(ObjectPack),
+                                      (priv->repo_version > 0));
+    if (!fs_obj) {
+        g_warning ("Bad fs object %s.\n", pack->id);
+        goto bad;
+    }
 
-    type = seaf_metadata_type_from_data(pack->object, clen);
-    if (type == SEAF_METADATA_TYPE_DIR) {
-        SeafDir *dir;
-        dir = seaf_dir_from_data (pack->id, pack->object, clen - 41);
-        if (!dir) {
-            g_warning ("Bad directory object %s.\n", pack->id);
-            goto bad;
-        }
+    if (fs_obj->type == SEAF_METADATA_TYPE_DIR) {
+        SeafDir *dir = (SeafDir *)fs_obj;
         int ret = check_seafdir (processor, dir);
-        seaf_dir_free (dir);
         if (ret < 0)
             goto bad;
-    } else if (type == SEAF_METADATA_TYPE_FILE) {
+    } else if (fs_obj->type == SEAF_METADATA_TYPE_FILE) {
         /* TODO: check seafile format. */
 #if 0
         int ret = seafile_check_data_format (pack->object, clen - 41);
@@ -413,10 +469,9 @@ recv_fs_object (CcnetProcessor *processor, char *content, int clen)
             goto bad;
         }
 #endif
-    } else {
-        g_warning ("Invalid object type.\n");
-        goto bad;
     }
+
+    seaf_fs_object_free (fs_obj);
 
     if (save_fs_object (processor, pack, clen) < 0) {
         goto bad;
@@ -429,6 +484,8 @@ bad:
                                    SS_BAD_OBJECT, NULL, 0);
     g_warning ("[recvfs] Bad fs object received.\n");
     ccnet_processor_done (processor, FALSE);
+
+    seaf_fs_object_free (fs_obj);
 
     return -1;
 }
@@ -543,7 +600,7 @@ handle_update (CcnetProcessor *processor,
                 (TimerCB)check_end_condition, processor, CHECK_INTERVAL);
             processor->state = FETCH_OBJECT;
         } else {
-            g_warning ("Bad response: %s %s\n", code, code_msg);
+            g_warning ("Bad update: %s %s\n", code, code_msg);
             ccnet_processor_send_response (processor,
                                            SC_BAD_UPDATE_CODE, SS_BAD_UPDATE_CODE,
                                            NULL, 0);
@@ -560,7 +617,7 @@ handle_update (CcnetProcessor *processor,
         } else if (strncmp(code, SC_OBJECT, 3) == 0) {
             recv_fs_object (processor, content, clen);
         } else {
-            g_warning ("Bad response: %s %s\n", code, code_msg);
+            g_warning ("Bad update: %s %s\n", code, code_msg);
             ccnet_processor_send_response (processor,
                                            SC_BAD_UPDATE_CODE, SS_BAD_UPDATE_CODE,
                                            NULL, 0);

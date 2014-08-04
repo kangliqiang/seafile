@@ -127,6 +127,7 @@ function warning_if_seafile_not_running () {
         echo
         echo "Warning: seafile-controller not running. Have you run \"./seafile.sh start\" ?"
         echo
+        exit 1
     fi
 }
 
@@ -159,7 +160,8 @@ function before_start() {
 function start_seahub () {
     before_start;
     echo "Starting seahub at port ${port} ..."
-    $PYTHON "${manage_py}" run_gunicorn -c "${gunicorn_conf}" -b "0.0.0.0:${port}"
+    check_init_admin;
+    $PYTHON "${manage_py}" run_gunicorn -c "${gunicorn_conf}" -b "0.0.0.0:${port}" --preload
 
     # Ensure seahub is started successfully
     sleep 5
@@ -168,12 +170,21 @@ function start_seahub () {
         echo "Please try to run \"./seahub.sh start\" again"
         exit 1;
     fi
+    echo
+    echo "Seahub is started"
+    echo
 }
 
 function start_seahub_fastcgi () {
     before_start;
-    echo "Starting seahub (fastcgi) at port ${port} ..."
-    $PYTHON "${manage_py}" runfcgi host=127.0.0.1 port=$port pidfile=$pidfile \
+
+    # Returns 127.0.0.1 if SEAFILE_FASTCGI_HOST is unset or hasn't got any value,
+    # otherwise returns value of SEAFILE_FASTCGI_HOST environment variable
+    address=`(test -z "$SEAFILE_FASTCGI_HOST" && echo "127.0.0.1") || echo $SEAFILE_FASTCGI_HOST`
+
+    echo "Starting seahub (fastcgi) at ${address}:${port} ..."
+    check_init_admin;
+    $PYTHON "${manage_py}" runfcgi host=$address port=$port pidfile=$pidfile \
         outlog=${accesslog} errlog=${errorlog}
 
     # Ensure seahub is started successfully
@@ -182,6 +193,9 @@ function start_seahub_fastcgi () {
         printf "\033[33mError:Seahub failed to start.\033[m\n"
         exit 1;
     fi
+    echo
+    echo "Seahub is started"
+    echo
 }
 
 function stop_seahub () {
@@ -193,6 +207,13 @@ function stop_seahub () {
         return 0
     else
         echo "Seahub is not running"
+    fi
+}
+
+function check_init_admin() {
+    check_init_admin_script=${INSTALLPATH}/check_init_admin.py
+    if ! $PYTHON $check_init_admin_script; then
+        exit 1
     fi
 }
 

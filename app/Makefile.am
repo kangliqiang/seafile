@@ -21,16 +21,16 @@ seafile_SOURCES = seafile.c
 seafile_LDADD =  @CCNET_LIBS@ \
 	$(top_builddir)/lib/libseafile.la \
 	$(top_builddir)/lib/libseafile_common.la \
-	@SEARPC_LIBS@ \
-	@GLIB2_LIBS@  @GOBJECT_LIBS@ -lssl @LIB_RT@ @LIB_UUID@ -lsqlite3
+	@SEARPC_LIBS@ @JANSSON_LIBS@ \
+	@GLIB2_LIBS@  @GOBJECT_LIBS@ -lssl @LIB_RT@ @LIB_UUID@ -lsqlite3 @ZLIB_LIBS@
 
 seafile_LDFALGS = @STATIC_COMPILE@ @CONSOLE@
 
 if COMPILE_SERVER
 seafserv_tool_SOURCES = seafserv-tool.c
 seafserv_tool_LDADD =  @CCNET_LIBS@ \
-	$(top_builddir)/lib/libseafile.la @SEARPC_LIBS@ \
-	@GLIB2_LIBS@  @GOBJECT_LIBS@ -lssl @LIB_RT@ @LIB_UUID@ -lsqlite3
+	$(top_builddir)/lib/libseafile.la @SEARPC_LIBS@ @JANSSON_LIBS@ \
+	@GLIB2_LIBS@  @GOBJECT_LIBS@ -lssl @LIB_RT@ @LIB_UUID@ -lsqlite3 @ZLIB_LIBS@
 
 seafserv_tool_LDFLAGS = @STATIC_COMPILE@ @CONSOLE@ @SERVER_PKG_RPATH@
 endif

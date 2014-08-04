@@ -27,14 +27,19 @@
 #include "processors/check-tx-slave-v3-proc.h"
 #include "processors/recvfs-proc.h"
 #include "processors/putfs-proc.h"
-#include "processors/putblock-v2-proc.h"
-#include "processors/recvblock-v2-proc.h"
 #include "processors/recvbranch-proc.h"
 #include "processors/sync-repo-slave-proc.h"
 #include "processors/putcommit-v2-proc.h"
+#include "processors/putcommit-v3-proc.h"
 #include "processors/recvcommit-v3-proc.h"
 #include "processors/putcs-v2-proc.h"
 #include "processors/checkbl-proc.h"
+#include "processors/checkff-proc.h"
+#include "processors/putca-proc.h"
+#include "processors/check-protocol-slave-proc.h"
+#include "processors/recvfs-v2-proc.h"
+#include "processors/recvbranch-v2-proc.h"
+#include "processors/putfs-v2-proc.h"
 
 #include "cdc/cdc.h"
 
@@ -74,10 +79,6 @@ static void register_processors (CcnetClient *client)
                             SEAFILE_TYPE_CHECK_TX_SLAVE_V2_PROC, NULL);
     ccnet_register_service (client, "seafile-check-tx-slave-v3", "basic",
                             SEAFILE_TYPE_CHECK_TX_SLAVE_V3_PROC, NULL);
-    ccnet_register_service (client, "seafile-putblock-v2", "basic",
-                            SEAFILE_TYPE_PUTBLOCK_V2_PROC, NULL);
-    ccnet_register_service (client, "seafile-recvblock-v2", "basic",
-                            SEAFILE_TYPE_RECVBLOCK_V2_PROC, NULL);
     ccnet_register_service (client, "seafile-recvfs", "basic",
                             SEAFILE_TYPE_RECVFS_PROC, NULL);
     ccnet_register_service (client, "seafile-putfs", "basic",
@@ -88,12 +89,26 @@ static void register_processors (CcnetClient *client)
                             SEAFILE_TYPE_SYNC_REPO_SLAVE_PROC, NULL);
     ccnet_register_service (client, "seafile-putcommit-v2", "basic",
                             SEAFILE_TYPE_PUTCOMMIT_V2_PROC, NULL);
+    ccnet_register_service (client, "seafile-putcommit-v3", "basic",
+                            SEAFILE_TYPE_PUTCOMMIT_V3_PROC, NULL);
     ccnet_register_service (client, "seafile-recvcommit-v3", "basic",
                             SEAFILE_TYPE_RECVCOMMIT_V3_PROC, NULL);
     ccnet_register_service (client, "seafile-putcs-v2", "basic",
                             SEAFILE_TYPE_PUTCS_V2_PROC, NULL);
     ccnet_register_service (client, "seafile-checkbl", "basic",
                             SEAFILE_TYPE_CHECKBL_PROC, NULL);
+    ccnet_register_service (client, "seafile-checkff", "basic",
+                            SEAFILE_TYPE_CHECKFF_PROC, NULL);
+    ccnet_register_service (client, "seafile-putca", "basic",
+                            SEAFILE_TYPE_PUTCA_PROC, NULL);
+    ccnet_register_service (client, "seafile-check-protocol-slave", "basic",
+                            SEAFILE_TYPE_CHECK_PROTOCOL_SLAVE_PROC, NULL);
+    ccnet_register_service (client, "seafile-recvfs-v2", "basic",
+                            SEAFILE_TYPE_RECVFS_V2_PROC, NULL);
+    ccnet_register_service (client, "seafile-recvbranch-v2", "basic",
+                            SEAFILE_TYPE_RECVBRANCH_V2_PROC, NULL);
+    ccnet_register_service (client, "seafile-putfs-v2", "basic",
+                            SEAFILE_TYPE_PUTFS_V2_PROC, NULL);
 }
 
 #include <searpc.h>
@@ -146,6 +161,11 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      searpc_signature_int__string_string_string_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_change_repo_passwd,
+                                     "seafile_change_repo_passwd",
+                                     searpc_signature_int__string_string_string_string());
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_is_repo_owner,
                                      "seafile_is_repo_owner",
                                      searpc_signature_int__string_string());
@@ -186,11 +206,11 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_post_file_blocks,
                                      "seafile_post_file_blocks",
-                    searpc_signature_string__string_string_string_string_string_string_int64());
+                    searpc_signature_string__string_string_string_string_string_string_int64_int());
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_post_multi_files,
                                      "seafile_post_multi_files",
-                    searpc_signature_string__string_string_string_string_string());
+                    searpc_signature_string__string_string_string_string_string_int());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_put_file,
@@ -219,12 +239,12 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_copy_file,
                                      "seafile_copy_file",
-       searpc_signature_int__string_string_string_string_string_string_string());
+       searpc_signature_object__string_string_string_string_string_string_string_int_int());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_move_file,
                                      "seafile_move_file",
-       searpc_signature_int__string_string_string_string_string_string_string());
+       searpc_signature_object__string_string_string_string_string_string_string_int_int());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_rename_file,
@@ -249,37 +269,37 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_commit,
                                      "seafile_get_commit",
-                                     searpc_signature_object__string());
+                                     searpc_signature_object__string_int_string());
     
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_list_dir,
                                      "seafile_list_dir",
-                                     searpc_signature_objlist__string_int_int());
+                                     searpc_signature_objlist__string_string_int_int());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_list_file,
                                      "seafile_list_file",
-                                     searpc_signature_string__string_int_int());
+                                     searpc_signature_string__string_string_int_int());
     
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_file_size,
                                      "seafile_get_file_size",
-                                     searpc_signature_int64__string());
+                                     searpc_signature_int64__string_int_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_dir_size,
                                      "seafile_get_dir_size",
-                                     searpc_signature_int64__string());
+                                     searpc_signature_int64__string_int_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_list_dir_by_path,
                                      "seafile_list_dir_by_path",
-                                     searpc_signature_objlist__string_string());
+                                     searpc_signature_objlist__string_string_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_dirid_by_path,
                                      "seafile_get_dirid_by_path",
-                                     searpc_signature_string__string_string());
+                                     searpc_signature_string__string_string_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_file_id_by_path,
@@ -325,10 +345,6 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      seafile_list_share_repos,
                                      "seafile_list_share_repos",
                                      searpc_signature_objlist__string_string_int_int());
-    searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_list_org_share_repos,
-                                     "seafile_list_org_share_repos",
-                                     searpc_signature_objlist__int_string_string_int_int());
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_remove_share,
                                      "seafile_remove_share",
@@ -405,6 +421,11 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      seafile_list_repo_tokens_by_email,
                                      "seafile_list_repo_tokens_by_email",
                                      searpc_signature_objlist__string());
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_delete_repo_tokens_by_peer_id,
+                                     "seafile_delete_repo_tokens_by_peer_id",
+                                     searpc_signature_int__string_string());
     
     /* quota */
     searpc_server_register_function ("seafserv-threaded-rpcserver",
@@ -415,14 +436,6 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      seafile_get_user_share_usage,
                                      "seafile_get_user_share_usage",
                                      searpc_signature_int64__string());
-    searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_get_org_quota_usage,
-                                     "seafile_get_org_quota_usage",
-                                     searpc_signature_int64__int());
-    searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_get_org_user_quota_usage,
-                                     "seafile_get_org_user_quota_usage",
-                                     searpc_signature_int64__int_string());
 
     /* virtual repo */
     searpc_server_register_function ("seafserv-threaded-rpcserver",
@@ -450,6 +463,18 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      seafile_web_query_access_token,
                                      "seafile_web_query_access_token",
                                      searpc_signature_object__string());
+
+    /* Copy task related. */
+
+    searpc_server_register_function ("seafserv-rpcserver",
+                                     seafile_get_copy_task,
+                                     "get_copy_task",
+                                     searpc_signature_object__string());
+
+    searpc_server_register_function ("seafserv-rpcserver",
+                                     seafile_cancel_copy_task,
+                                     "cancel_copy_task",
+                                     searpc_signature_int__string());
 
     /* chunk server manipulation */
     searpc_server_register_function ("seafserv-rpcserver",
@@ -497,22 +522,6 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      "get_user_quota",
                                      searpc_signature_int64__string());
     searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_set_org_quota,
-                                     "set_org_quota",
-                                     searpc_signature_int__int_int64());
-    searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_get_org_quota,
-                                     "get_org_quota",
-                                     searpc_signature_int64__int());
-    searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_set_org_user_quota,
-                                     "set_org_user_quota",
-                                     searpc_signature_int__int_string_int64());
-    searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_get_org_user_quota,
-                                     "get_org_user_quota",
-                                     searpc_signature_int64__int_string());
-    searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_check_quota,
                                      "check_quota",
                                      searpc_signature_int__string());
@@ -526,7 +535,7 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_file_id_by_commit_and_path,
                                      "seafile_get_file_id_by_commit_and_path",
-                                     searpc_signature_string__string_string());
+                                     searpc_signature_string__string_string_string());
 
     if (!cloud_mode) {
         searpc_server_register_function ("seafserv-threaded-rpcserver",
@@ -555,89 +564,6 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                          searpc_signature_objlist__string());
     }
 
-    /* Org repo */
-    if (cloud_mode) {
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_create_org_repo,
-                                         "seafile_create_org_repo",
-            searpc_signature_string__string_string_string_string_int());
-
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_create_org_enc_repo,
-                                         "seafile_create_org_enc_repo",
-            searpc_signature_string__string_string_string_string_string_string_int_int());
-
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_get_org_id_by_repo_id,
-                                         "seafile_get_org_id_by_repo_id",
-                                         searpc_signature_int__string());
-
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_get_org_repo_list,
-                                         "seafile_get_org_repo_list",
-                                         searpc_signature_objlist__int_int_int());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_remove_org_repo_by_org_id,
-                                         "seafile_remove_org_repo_by_org_id",
-                                         searpc_signature_int__int());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_list_org_repos_by_owner,
-                                         "list_org_repos_by_owner",
-                                  searpc_signature_objlist__int_string());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_get_org_repo_owner,
-                                         "get_org_repo_owner",
-                                  searpc_signature_string__string());
-
-        /* org group repo */
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_add_org_group_repo,
-                                         "add_org_group_repo",
-            searpc_signature_int__string_int_int_string_string());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_del_org_group_repo,
-                                         "del_org_group_repo",
-                                         searpc_signature_int__string_int_int());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_get_org_group_repoids,
-                                         "get_org_group_repoids",
-                                         searpc_signature_string__int_int());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_get_org_group_repo_owner,
-                                         "get_org_group_repo_owner",
-                                searpc_signature_string__int_int_string());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_get_org_group_repos_by_owner,
-                                         "get_org_group_repos_by_owner",
-                                searpc_signature_objlist__int_string());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_get_org_groups_by_repo,
-                                         "get_org_groups_by_repo",
-                                         searpc_signature_string__int_string());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_set_org_group_repo_permission,
-                                         "set_org_group_repo_permission",
-                                         searpc_signature_int__int_int_string_string());
-                                         
-        /* org inner pub repo */
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_set_org_inner_pub_repo,
-                                         "set_org_inner_pub_repo",
-                                         searpc_signature_int__int_string_string());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_unset_org_inner_pub_repo,
-                                         "unset_org_inner_pub_repo",
-                                         searpc_signature_int__int_string());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_list_org_inner_pub_repos,
-                                         "list_org_inner_pub_repos",
-                                         searpc_signature_objlist__int());
-        searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                         seafile_list_org_inner_pub_repos_by_owner,
-                                         "list_org_inner_pub_repos_by_owner",
-                                         searpc_signature_objlist__int_string());
-    }
-
     /* History */
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_set_repo_history_limit,
@@ -647,6 +573,19 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      seafile_get_repo_history_limit,
                                      "get_repo_history_limit",
                                      searpc_signature_int__string());
+
+    /* System default library */
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_get_system_default_repo_id,
+                                     "get_system_default_repo_id",
+                                     searpc_signature_string__void());
+}
+
+static struct event sigusr1;
+
+static void sigusr1Handler (int fd, short event, void *user_data)
+{
+    seafile_log_reopen ();
 }
 
 static void
@@ -654,6 +593,10 @@ set_signal_handlers (SeafileSession *session)
 {
 #ifndef WIN32
     signal (SIGPIPE, SIG_IGN);
+
+    /* design as reopen log */
+    event_set(&sigusr1, SIGUSR1, EV_SIGNAL | EV_PERSIST, sigusr1Handler, NULL);
+    event_add(&sigusr1, NULL);
 #endif
 }
 
@@ -842,10 +785,29 @@ main (int argc, char **argv)
     argc -= optind;
     argv += optind;
 
-#if !defined(WIN32) && !defined(__APPLE__)
-    if (daemon_mode)
+#ifndef WIN32
+    if (daemon_mode) {
+#ifndef __APPLE__
         daemon (1, 0);
-#endif
+#else   /* __APPLE */
+        /* daemon is deprecated under APPLE
+         * use fork() instead
+         * */
+        switch (fork ()) {
+          case -1:
+              seaf_warning ("Failed to daemonize");
+              exit (-1);
+              break;
+          case 0:
+              /* all good*/
+              break;
+          default:
+              /* kill origin process */
+              exit (0);
+        }
+#endif  /* __APPLE */
+    }
+#endif /* !WIN32 */
 
     cdc_init ();
 
@@ -916,6 +878,9 @@ main (int argc, char **argv)
         }
     }
     atexit (on_seaf_server_exit);
+
+    /* Create a system default repo to contain the tutorial file. */
+    schedule_create_system_default_repo (seaf);
 
     ccnet_main (client);
 

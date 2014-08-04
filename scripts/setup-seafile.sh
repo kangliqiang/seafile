@@ -6,6 +6,7 @@ TOPDIR=$(dirname "${INSTALLPATH}")
 default_ccnet_conf_dir=${TOPDIR}/ccnet
 default_seafile_data_dir=${TOPDIR}/seafile-data
 default_seahub_db=${TOPDIR}/seahub.db
+default_conf_dir=${TOPDIR}/conf
 
 export SEAFILE_LD_LIBRARY_PATH=${INSTALLPATH}/seafile/lib/:${INSTALLPATH}/seafile/lib64:${LD_LIBRARY_PATH}
 
@@ -166,8 +167,6 @@ function check_python () {
         fi
         hint="\nOn Debian/Ubntu: apt-get install python-setuptools\nOn CentOS/RHEL: yum install python${py26}-distribute"
         check_python_module pkg_resources setuptools "${hint}"
-        hint="\nOn Debian/Ubntu: apt-get install python-simplejson\nOn CentOS/RHEL: yum install python${py26}-simplejson"
-        check_python_module simplejson python-simplejson "${hint}"
         hint="\nOn Debian/Ubntu: apt-get install python-imaging\nOn CentOS/RHEL: yum install python${py26}-imaging"
         check_python_module PIL python-imaging "${hint}"
         check_python_module sqlite3 python-sqlite3
@@ -266,18 +265,18 @@ function get_seafile_server_port () {
     echo
 }
 
-function get_httpserver_port () {
-    question="What tcp port do you want to use for seafile httpserver?" 
+function get_fileserver_port () {
+    question="What tcp port do you want to use for seafile fileserver?" 
     hint="8082 is the recommended port."
     default="8082"
     ask_question "${question}\n${hint}" "${default}"
-    read httpserver_port
-    if [[ "${httpserver_port}" == "" ]]; then
-        httpserver_port="${default}"
+    read fileserver_port
+    if [[ "${fileserver_port}" == "" ]]; then
+        fileserver_port="${default}"
     fi
-    if [[ ! ${httpserver_port} =~ ^[0-9]+$ ]]; then
-        echo "\"${httpserver_port}\" is not a valid port number. "
-        get_httpserver_port
+    if [[ ! ${fileserver_port} =~ ^[0-9]+$ ]]; then
+        echo "\"${fileserver_port}\" is not a valid port number. "
+        get_fileserver_port
     fi
     echo
 }
@@ -323,6 +322,29 @@ function get_seafile_data_dir () {
     echo
 }
 
+function gen_seafdav_conf () {
+    mkdir -p ${default_conf_dir}
+    seafdav_conf=${default_conf_dir}/seafdav.conf
+    if ! $(cat > ${seafdav_conf} <<EOF
+[WEBDAV]
+enabled = false
+port = 8080
+fastcgi = false
+share_name = /
+EOF
+); then
+    echo "failed to generate seafdav.conf";
+    err_and_quit
+fi
+}
+
+function copy_user_manuals() {
+    src_docs_dir=${INSTALLPATH}/seafile/docs/
+    library_template_dir=${seafile_data_dir}/library-template
+    mkdir -p ${library_template_dir}
+    cp -f ${src_docs_dir}/*.doc ${library_template_dir}
+}
+
 
 # -------------------------------------------
 # Main workflow of this script 
@@ -346,7 +368,7 @@ fi
 get_seafile_data_dir;
 if [[ ${use_existing_seafile} != "true" ]]; then
     get_seafile_server_port
-    get_httpserver_port
+    get_fileserver_port
 fi
 
 sleep .5
@@ -364,7 +386,7 @@ fi
 if [[ ${use_existing_seafile} != "true" ]]; then
     printf "seafile data dir:   \033[33m${seafile_data_dir}\033[m\n"
     printf "seafile port:       \033[33m${seafile_server_port}\033[m\n"
-    printf "httpserver port:    \033[33m${httpserver_port}\033[m\n"
+    printf "fileserver port:    \033[33m${fileserver_port}\033[m\n"
 else
     printf "seafile data dir:   use existing data in    \033[33m${seafile_data_dir}\033[m\n"
 fi
@@ -398,7 +420,7 @@ if [[ "${use_existing_seafile}" != "true" ]]; then
     echo "Generating seafile configuration in ${seafile_data_dir} ..."
     echo
     if ! LD_LIBRARY_PATH=$SEAFILE_LD_LIBRARY_PATH ${seaf_server_init} --seafile-dir "${seafile_data_dir}" \
-        --port ${seafile_server_port} --httpserver-port ${httpserver_port}; then
+        --port ${seafile_server_port} --fileserver-port ${fileserver_port}; then
         
         echo "Failed to generate seafile configuration"
         err_and_quit;
@@ -412,6 +434,12 @@ fi
 # -------------------------------------------
 
 echo "${seafile_data_dir}" > "${default_ccnet_conf_dir}/seafile.ini"
+
+# -------------------------------------------
+# Generate seafevents.conf
+# -------------------------------------------
+
+gen_seafdav_conf;
 
 # -------------------------------------------
 # generate seahub/settings.py
@@ -435,9 +463,9 @@ echo "-----------------------------------------------------------------"
 echo
 read dummy
 
-echo "Please specify the email address and password for the seahub administrator."
-echo "You can use them to login as admin on your seahub website."
-echo
+# echo "Please specify the email address and password for the seahub administrator."
+# echo "You can use them to login as admin on your seahub website."
+# echo
 
 function get_seahub_admin_email () {
     question="Please specify the email address for the seahub administrator:"
@@ -471,48 +499,48 @@ function get_seahub_admin_passwd () {
     fi
 }
     
-get_seahub_admin_email;
-sleep .5;
-get_seahub_admin_passwd;
-seahub_admin_passwd_enc=$(echo -n ${seahub_admin_passwd} | sha1sum | grep -o "[0-9a-f]*")
-sleep .5;
+# get_seahub_admin_email;
+# sleep .5;
+# get_seahub_admin_passwd;
+# seahub_admin_passwd_enc=$(echo -n ${seahub_admin_passwd} | sha1sum | grep -o "[0-9a-f]*")
+# sleep .5;
 
-printf "\n\n"
-echo "This is your seahub admin username/password"
-echo
-printf "admin username:         \033[33m${seahub_admin_email}\033[m\n"
-printf "admin password:         \033[33m**************\033[m\n\n"
+# printf "\n\n"
+# echo "This is your seahub admin username/password"
+# echo
+# printf "admin username:         \033[33m${seahub_admin_email}\033[m\n"
+# printf "admin password:         \033[33m**************\033[m\n\n"
 
-echo
-echo "If you are OK with the configuration, press [ENTER] to continue."
-read dummy
+# echo
+# echo "If you are OK with the configuration, press [ENTER] to continue."
+# read dummy
 
-usermgr_db_dir=${default_ccnet_conf_dir}/PeerMgr/
-usermgr_db=${usermgr_db_dir}/usermgr.db
+# usermgr_db_dir=${default_ccnet_conf_dir}/PeerMgr/
+# usermgr_db=${usermgr_db_dir}/usermgr.db
 
-if [[ "${use_existing_ccnet}" != "true" ]]; then
-    # create admin user/passwd entry in ccnet db
-    if ! mkdir -p "${usermgr_db_dir}"; then
-        echo "Failed to create seahub admin."
-        err_and_quit;
-    fi
+# if [[ "${use_existing_ccnet}" != "true" ]]; then
+#     # create admin user/passwd entry in ccnet db
+#     if ! mkdir -p "${usermgr_db_dir}"; then
+#         echo "Failed to create seahub admin."
+#         err_and_quit;
+#     fi
     
-    sql="CREATE TABLE IF NOT EXISTS EmailUser (id INTEGER NOT NULL PRIMARY KEY, email TEXT, passwd TEXT, is_staff bool NOT NULL, is_active bool NOT NULL, ctime INTEGER)";
+#     sql="CREATE TABLE IF NOT EXISTS EmailUser (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, email TEXT, passwd TEXT, is_staff bool NOT NULL, is_active bool NOT NULL, ctime INTEGER)";
 
-    if ! sqlite3 "${usermgr_db}" "${sql}" ; then
-        rm -f "${usermgr_db}"
-        echo "Failed to create seahub admin."
-        err_and_quit;
-    fi
+#     if ! sqlite3 "${usermgr_db}" "${sql}" ; then
+#         rm -f "${usermgr_db}"
+#         echo "Failed to create seahub admin."
+#         err_and_quit;
+#     fi
     
-    sql="INSERT INTO EmailUser(email, passwd, is_staff, is_active, ctime) VALUES (\"${seahub_admin_email}\", \"${seahub_admin_passwd_enc}\", 1, 1, 0);"
+#     sql="INSERT INTO EmailUser(email, passwd, is_staff, is_active, ctime) VALUES (\"${seahub_admin_email}\", \"${seahub_admin_passwd_enc}\", 1, 1, 0);"
 
-    if ! sqlite3 "${usermgr_db}" "${sql}" ; then
-        rm -f "${usermgr_db}"
-        echo "Failed to create seahub admin."
-        err_and_quit;
-    fi
-fi
+#     if ! sqlite3 "${usermgr_db}" "${sql}" ; then
+#         rm -f "${usermgr_db}"
+#         echo "Failed to create seahub admin."
+#         err_and_quit;
+#     fi
+# fi
 
 echo "Creating seahub database now... "
 echo
@@ -563,6 +591,11 @@ echo "done"
 echo
 
 # -------------------------------------------
+# copy user manuals to library template
+# -------------------------------------------
+copy_user_manuals;
+
+# -------------------------------------------
 # final message
 # -------------------------------------------
 
@@ -582,7 +615,7 @@ echo "-----------------------------------------------------------------"
 echo
 echo "port of ccnet server:         ${server_port}"
 echo "port of seafile server:       ${seafile_server_port}"
-echo "port of seafile httpserver:   ${httpserver_port}"
+echo "port of seafile fileserver:   ${fileserver_port}"
 echo "port of seahub:               8000"
 echo
 echo -e "When problems occur, refer to\n"

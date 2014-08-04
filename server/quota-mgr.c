@@ -111,28 +111,33 @@ seaf_quota_manager_set_user_quota (SeafQuotaManager *mgr,
                                    gint64 quota)
 {
     SeafDB *db = mgr->session->db;
-    char sql[512];
-
     if (seaf_db_type(db) == SEAF_DB_TYPE_PGSQL) {
-        gboolean err;
-        snprintf(sql, sizeof(sql),
-                 "SELECT 1 FROM UserQuota WHERE user='%s'", user);
-        if (seaf_db_check_for_existence(db, sql, &err))
-            snprintf(sql, sizeof(sql),
-                     "UPDATE UserQuota SET quota=%"G_GINT64_FORMAT
-                     " WHERE user='%s'", quota, user);
-        else
-            snprintf(sql, sizeof(sql),
-                     "INSERT INTO UserQuota VALUES "
-                     "('%s', %"G_GINT64_FORMAT")", user, quota);
+        gboolean exists, err;
+        int rc;
+
+        exists = seaf_db_statement_exists (db,
+                                           "SELECT 1 FROM UserQuota WHERE \"user\"=?",
+                                           &err, 1, "string", user);
         if (err)
             return -1;
-        return seaf_db_query (db, sql);
+
+        if (exists)
+            rc = seaf_db_statement_query (db,
+                                          "UPDATE UserQuota SET quota=? "
+                                          "WHERE \"user\"=?",
+                                          2, "int64", quota, "string", user);
+        else
+            rc = seaf_db_statement_query (db,
+                                          "INSERT INTO UserQuota VALUES "
+                                          "(?, ?)",
+                                          2, "string", user, "int64", quota);
+        return rc;
     } else {
-        snprintf (sql, sizeof(sql),
-                  "REPLACE INTO UserQuota VALUES ('%s', %"G_GINT64_FORMAT")",
-                  user, quota);
-        return seaf_db_query (mgr->session->db, sql);
+        int rc;
+        rc = seaf_db_statement_query (db,
+                                      "REPLACE INTO UserQuota VALUES (?, ?)",
+                                      2, "string", user, "int64", quota);
+        return rc;
     }
 }
 
@@ -140,13 +145,16 @@ gint64
 seaf_quota_manager_get_user_quota (SeafQuotaManager *mgr,
                                    const char *user)
 {
-    char sql[512];
+    char *sql;
     gint64 quota;
 
-    snprintf (sql, sizeof(sql),
-              "SELECT quota FROM UserQuota WHERE user='%s'",
-              user);
-    quota = seaf_db_get_int64 (mgr->session->db, sql);
+    if (seaf_db_type(mgr->session->db) != SEAF_DB_TYPE_PGSQL)
+        sql = "SELECT quota FROM UserQuota WHERE user=?";
+    else
+        sql = "SELECT quota FROM UserQuota WHERE \"user\"=?";
+
+    quota = seaf_db_statement_get_int64 (mgr->session->db, sql,
+                                         1, "string", user);
     if (quota <= 0)
         quota = mgr->default_quota;
 
@@ -159,28 +167,31 @@ seaf_quota_manager_set_org_quota (SeafQuotaManager *mgr,
                                   gint64 quota)
 {
     SeafDB *db = mgr->session->db;
-    char sql[512];
 
     if (seaf_db_type(db) == SEAF_DB_TYPE_PGSQL) {
-        gboolean err;
-        snprintf(sql, sizeof(sql),
-                 "SELECT 1 FROM OrgQuota WHERE org_id=%d", org_id);
-        if (seaf_db_check_for_existence(db, sql, &err))
-            snprintf(sql, sizeof(sql),
-                     "UPDATE OrgQuota SET quota=%"G_GINT64_FORMAT
-                     " WHERE org_id=%d", quota, org_id);
-        else
-            snprintf(sql, sizeof(sql),
-                     "INSERT INTO OrgQuota VALUES "
-                     "(%d, %"G_GINT64_FORMAT")", org_id, quota);
+        gboolean exists, err;
+        int rc;
+
+        exists = seaf_db_statement_exists (db,
+                                           "SELECT 1 FROM OrgQuota WHERE org_id=?",
+                                           &err, 1, "int", org_id);
         if (err)
             return -1;
-        return seaf_db_query (db, sql);
+
+        if (exists)
+            rc = seaf_db_statement_query (db,
+                                          "UPDATE OrgQuota SET quota=? WHERE org_id=?",
+                                          2, "int64", quota, "int", org_id);
+        else
+            rc = seaf_db_statement_query (db,
+                                          "INSERT INTO OrgQuota VALUES (?, ?)",
+                                          2, "int", org_id, "int64", quota);
+        return rc;
     } else {
-        snprintf (sql, sizeof(sql),
-                  "REPLACE INTO OrgQuota VALUES (%d, %"G_GINT64_FORMAT")",
-                  org_id, quota);
-        return seaf_db_query (mgr->session->db, sql);
+        int rc = seaf_db_statement_query (db,
+                                          "REPLACE INTO OrgQuota VALUES (?, ?)",
+                                          2, "int", org_id, "int64", quota);
+        return rc;
     }
 }
 
@@ -188,13 +199,11 @@ gint64
 seaf_quota_manager_get_org_quota (SeafQuotaManager *mgr,
                                   int org_id)
 {
-    char sql[512];
+    char *sql;
     gint64 quota;
 
-    snprintf (sql, sizeof(sql),
-              "SELECT quota FROM OrgQuota WHERE org_id='%d'",
-              org_id);
-    quota = seaf_db_get_int64 (mgr->session->db, sql);
+    sql = "SELECT quota FROM OrgQuota WHERE org_id=?";
+    quota = seaf_db_statement_get_int64 (mgr->session->db, sql, 1, "int", org_id);
     if (quota <= 0)
         quota = mgr->default_quota;
 
@@ -208,29 +217,36 @@ seaf_quota_manager_set_org_user_quota (SeafQuotaManager *mgr,
                                        gint64 quota)
 {
     SeafDB *db = mgr->session->db;
-    char sql[512];
+    int rc;
 
     if (seaf_db_type(db) == SEAF_DB_TYPE_PGSQL) {
-        gboolean err;
-        snprintf(sql, sizeof(sql),
-                 "SELECT 1 FROM OrgUserQuota WHERE org_id=%d AND user='%s'",
-                 org_id, user);
-        if (seaf_db_check_for_existence(db, sql, &err))
-            snprintf(sql, sizeof(sql),
-                     "UPDATE OrgUserQuota SET quota=%"G_GINT64_FORMAT
-                     " WHERE org_id=%d AND user='%s'", quota, org_id, user);
-        else
-            snprintf(sql, sizeof(sql),
-                     "INSERT INTO OrgQuota VALUES "
-                     "(%d, '%s', %"G_GINT64_FORMAT")", org_id, user, quota);
+        gboolean exists, err;
+
+        exists = seaf_db_statement_exists (db,
+                                           "SELECT 1 FROM OrgUserQuota "
+                                           "WHERE org_id=? AND \"user\"=?",
+                                           &err, 2, "int", org_id, "string", user);
         if (err)
             return -1;
-        return seaf_db_query (db, sql);
+
+        if (exists)
+            rc = seaf_db_statement_query (db,
+                                          "UPDATE OrgUserQuota SET quota=?"
+                                          " WHERE org_id=? AND \"user\"=?",
+                                          3, "int64", quota, "int", org_id,
+                                          "string", user);
+        else
+            rc = seaf_db_statement_query (db,
+                                          "INSERT INTO OrgQuota VALUES "
+                                          "(?, ?, ?)",
+                                          3, "int", org_id, "string", user,
+                                          "int64", quota);
+        return rc;
     } else {
-        snprintf (sql, sizeof(sql),
-                  "REPLACE INTO OrgUserQuota VALUES ('%d', '%s', %"G_GINT64_FORMAT")",
-                  org_id, user, quota);
-        return seaf_db_query (mgr->session->db, sql);
+        rc = seaf_db_statement_query (db,
+                                      "REPLACE INTO OrgUserQuota VALUES (?, ?, ?)",
+                                      3, "int", org_id, "string", user, "int64", quota);
+        return rc;
     }
 }
 
@@ -239,13 +255,16 @@ seaf_quota_manager_get_org_user_quota (SeafQuotaManager *mgr,
                                        int org_id,
                                        const char *user)
 {
-    char sql[512];
+    char *sql;
     gint64 quota;
 
-    snprintf (sql, sizeof(sql),
-              "SELECT quota FROM OrgUserQuota WHERE org_id='%d' AND user='%s'",
-              org_id, user);
-    quota = seaf_db_get_int64 (mgr->session->db, sql);
+    if (seaf_db_type(mgr->session->db) != SEAF_DB_TYPE_PGSQL)
+        sql = "SELECT quota FROM OrgUserQuota WHERE org_id=? AND user=?";
+    else
+        sql = "SELECT quota FROM OrgUserQuota WHERE org_id=? AND \"user\"=?";
+
+    quota = seaf_db_statement_get_int64 (mgr->session->db, sql,
+                                         2, "int", org_id, "string", user);
     /* return org quota if per user quota is not set. */
     if (quota <= 0)
         quota = seaf_quota_manager_get_org_quota (mgr, org_id);
@@ -260,7 +279,6 @@ seaf_quota_manager_check_quota (SeafQuotaManager *mgr,
     SeafVirtRepo *vinfo;
     const char *r_repo_id = repo_id;
     char *user = NULL;
-    int org_id;
     gint64 quota, usage;
     int ret = 0;
 
@@ -272,15 +290,6 @@ seaf_quota_manager_check_quota (SeafQuotaManager *mgr,
     user = seaf_repo_manager_get_repo_owner (seaf->repo_mgr, r_repo_id);
     if (user != NULL) {
         quota = seaf_quota_manager_get_user_quota (mgr, user);
-    } else if (seaf->cloud_mode) {
-        org_id = seaf_repo_manager_get_repo_org (seaf->repo_mgr, r_repo_id);
-        if (org_id < 0) {
-            seaf_warning ("Repo %s has no owner.\n", r_repo_id);
-            ret = -1;
-            goto out;
-        }
-
-        quota = seaf_quota_manager_get_org_quota (mgr, org_id);
     } else {
         seaf_warning ("Repo %s has no owner.\n", r_repo_id);
         ret = -1;
@@ -290,25 +299,22 @@ seaf_quota_manager_check_quota (SeafQuotaManager *mgr,
     if (quota == INFINITE_QUOTA)
         goto out;
 
-    if (user) {
-        if (!mgr->calc_share_usage) {
-            usage = seaf_quota_manager_get_user_usage (mgr, user);
-        } else {
-            gint64 my_usage, share_usage;
-            share_usage = seaf_quota_manager_get_user_share_usage (mgr, user);
-            if (share_usage < 0) {
-                ret = -1;
-                goto out;
-            }
-            my_usage = seaf_quota_manager_get_user_usage (mgr, user);
-            if (my_usage < 0) {
-                ret = -1;
-                goto out;
-            }
-            usage = my_usage + share_usage;
+    if (!mgr->calc_share_usage) {
+        usage = seaf_quota_manager_get_user_usage (mgr, user);
+    } else {
+        gint64 my_usage, share_usage;
+        share_usage = seaf_quota_manager_get_user_share_usage (mgr, user);
+        if (share_usage < 0) {
+            ret = -1;
+            goto out;
         }
-    } else
-        usage = seaf_quota_manager_get_org_usage (mgr, org_id);
+        my_usage = seaf_quota_manager_get_user_usage (mgr, user);
+        if (my_usage < 0) {
+            ret = -1;
+            goto out;
+        }
+        usage = my_usage + share_usage;
+    }
 
     if (usage < 0 || usage >= quota)
         ret = -1;
@@ -332,18 +338,17 @@ get_total_size (SeafDBRow *row, void *vpsize)
 gint64
 seaf_quota_manager_get_user_usage (SeafQuotaManager *mgr, const char *user)
 {
-    char sql[512];
+    char *sql;
     gint64 total = 0;
 
-    snprintf (sql, sizeof(sql), 
-              "SELECT size FROM "
-              "RepoOwner o LEFT JOIN VirtualRepo v ON o.repo_id=v.repo_id, "
-              "RepoSize WHERE "
-              "owner_id='%s' AND o.repo_id=RepoSize.repo_id "
-              "AND v.repo_id IS NULL",
-              user);
-    if (seaf_db_foreach_selected_row (mgr->session->db, sql,
-                                      get_total_size, &total) < 0)
+    sql = "SELECT size FROM "
+        "RepoOwner o LEFT JOIN VirtualRepo v ON o.repo_id=v.repo_id, "
+        "RepoSize WHERE "
+        "owner_id=? AND o.repo_id=RepoSize.repo_id "
+        "AND v.repo_id IS NULL";
+    if (seaf_db_statement_foreach_row (mgr->session->db, sql,
+                                       get_total_size, &total,
+                                       1, "string", user) < 0)
         return -1;
 
     return total;
@@ -471,15 +476,14 @@ seaf_quota_manager_get_user_share_usage (SeafQuotaManager *mgr,
 gint64
 seaf_quota_manager_get_org_usage (SeafQuotaManager *mgr, int org_id)
 {
-    char sql[256];
+    char *sql;
     gint64 ret = 0;
 
-    snprintf (sql, sizeof(sql), 
-              "SELECT size FROM OrgRepo, RepoSize WHERE "
-              "org_id=%d AND OrgRepo.repo_id=RepoSize.repo_id",
-              org_id);
-    if (seaf_db_foreach_selected_row (mgr->session->db, sql,
-                                      get_total_size, &ret) < 0)
+    sql = "SELECT size FROM OrgRepo, RepoSize WHERE "
+        "org_id=? AND OrgRepo.repo_id=RepoSize.repo_id";
+    if (seaf_db_statement_foreach_row (mgr->session->db, sql,
+                                       get_total_size, &ret,
+                                       1, "int", org_id) < 0)
         return -1;
 
     return ret;
@@ -490,15 +494,14 @@ seaf_quota_manager_get_org_user_usage (SeafQuotaManager *mgr,
                                        int org_id,
                                        const char *user)
 {
-    char sql[256];
+    char *sql;
     gint64 ret = 0;
 
-    snprintf (sql, sizeof(sql), 
-              "SELECT size FROM OrgRepo, RepoSize WHERE "
-              "org_id=%d AND user = '%s' AND OrgRepo.repo_id=RepoSize.repo_id",
-              org_id, user);
-    if (seaf_db_foreach_selected_row (mgr->session->db, sql,
-                                      get_total_size, &ret) < 0)
+    sql = "SELECT size FROM OrgRepo, RepoSize WHERE "
+        "org_id=? AND user = ? AND OrgRepo.repo_id=RepoSize.repo_id";
+    if (seaf_db_statement_foreach_row (mgr->session->db, sql,
+                                       get_total_size, &ret,
+                                       2, "int", org_id, "string", user) < 0)
         return -1;
 
     return ret;

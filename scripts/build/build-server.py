@@ -36,6 +36,7 @@ import re
 import subprocess
 import optparse
 import atexit
+import platform
 
 ####################
 ### Global variables
@@ -70,17 +71,17 @@ def highlight(content, is_error=False):
 def info(msg):
     print highlight('[INFO] ') + msg
 
-def exist_in_path(prog):
-    '''Test whether prog exists in system path'''
+def find_in_path(prog):
+    '''Find a file in system path'''
     dirs = os.environ['PATH'].split(':')
     for d in dirs:
         if d == '':
             continue
         path = os.path.join(d, prog)
         if os.path.exists(path):
-            return True
+            return path
 
-    return False
+    return None
 
 def error(msg=None, usage=None):
     if msg:
@@ -218,7 +219,7 @@ class Seafile(Project):
             s3_support = '--enable-s3'
 
         self.build_commands = [
-            './configure --prefix=%s --disable-client --enable-server --enable-pgsql --enable-httpserver %s' \
+            './configure --prefix=%s --disable-client --enable-server --enable-pgsql %s' \
                 % (self.prefix, s3_support),
             'make',
             'make install'
@@ -238,12 +239,36 @@ class Seahub(Project):
     def get_version(self):
         return conf[CONF_SEAFILE_VERSION]
 
+    def build(self):
+        self.write_version_to_settings_py()
+
+        Project.build(self)
+
+    def write_version_to_settings_py(self):
+        '''Write the version of current seafile server to seahub'''
+        settings_py = os.path.join(self.projdir, 'seahub', 'settings.py')
+
+        line = '\nSEAFILE_VERSION = "%s"\n' % conf[CONF_VERSION]
+        with open(settings_py, 'a+') as fp:
+            fp.write(line)
+
+
 def check_seahub_thirdpart(thirdpartdir):
     '''The ${thirdpartdir} must have django/djblets/gunicorn pre-installed. So
     we can copy it to seahub/thirdpart
 
     '''
-    thirdpart_libs = ['Django', 'Djblets', 'gunicorn', 'flup', 'chardet']
+    thirdpart_libs = [
+        'Django',
+        'Djblets',
+        'gunicorn',
+        'flup',
+        'chardet',
+        # 'SQLAlchemy',
+        'python_daemon',
+        'lockfile',
+        'six',
+    ]
     def check_thirdpart_lib(name):
         name += '*/'
         if not glob.glob(os.path.join(thirdpartdir, name)):
@@ -256,6 +281,16 @@ def check_targz_src(proj, version, srcdir):
     src_tarball = os.path.join(srcdir, '%s-%s.tar.gz' % (proj, version))
     if not os.path.exists(src_tarball):
         error('%s not exists' % src_tarball)
+
+def check_targz_src_no_version(proj, srcdir):
+    src_tarball = os.path.join(srcdir, '%s.tar.gz' % proj)
+    if not os.path.exists(src_tarball):
+        error('%s not exists' % src_tarball)
+
+def check_pdf2htmlEX():
+    pdf2htmlEX_executable = find_in_path('pdf2htmlEX')
+    if pdf2htmlEX_executable is None:
+        error('pdf2htmlEX not found')
 
 def validate_args(usage, options):
     required_args = [
@@ -297,6 +332,10 @@ def validate_args(usage, options):
     check_targz_src('ccnet', ccnet_version, srcdir)
     check_targz_src('seafile', seafile_version, srcdir)
     check_targz_src('seahub', seafile_version, srcdir)
+    check_targz_src_no_version('seafdav', srcdir)
+    check_targz_src_no_version('seafobj', srcdir)
+
+    # check_pdf2htmlEX()
 
     # [ builddir ]
     builddir = get_option(CONF_BUILDDIR)
@@ -464,6 +503,10 @@ def setup_build_env():
                      '-I%s' % os.path.join(prefix, 'include'),
                      seperator=' ')
 
+    prepend_env_value('CPPFLAGS',
+                     '-DLIBICONV_PLUG',
+                     seperator=' ')
+
     if conf[CONF_NO_STRIP]:
         prepend_env_value('CPPFLAGS',
                          '-g -O0',
@@ -485,6 +528,28 @@ def setup_build_env():
     prepend_env_value('PKG_CONFIG_PATH', os.path.join(prefix, 'lib', 'pkgconfig'))
     prepend_env_value('PKG_CONFIG_PATH', os.path.join(prefix, 'lib64', 'pkgconfig'))
 
+def copy_user_manuals():
+    builddir = conf[CONF_BUILDDIR]
+    # src_pattern = os.path.join(builddir, Seafile().projdir, 'doc', '*.doc')
+    src_pattern = os.path.join(builddir, Seafile().projdir, 'doc', 'seafile-tutorial.doc')
+    dst_dir = os.path.join(builddir, 'seafile-server', 'seafile', 'docs')
+
+    must_mkdir(dst_dir)
+
+    for path in glob.glob(src_pattern):
+        must_copy(path, dst_dir)
+
+def copy_seafdav():
+    dst_dir = os.path.join(conf[CONF_BUILDDIR], 'seafile-server', 'seahub', 'thirdpart')
+    tarball = os.path.join(conf[CONF_SRCDIR], 'seafdav.tar.gz')
+    if run('tar xf %s -C %s' % (tarball, dst_dir)) != 0:
+        error('failed to uncompress %s' % tarball)
+
+    dst_dir = os.path.join(conf[CONF_BUILDDIR], 'seafile-server', 'seahub', 'thirdpart')
+    tarball = os.path.join(conf[CONF_SRCDIR], 'seafobj.tar.gz')
+    if run('tar xf %s -C %s' % (tarball, dst_dir)) != 0:
+        error('failed to uncompress %s' % tarball)
+
 def copy_scripts_and_libs():
     '''Copy server release scripts and shared libs, as well as seahub
     thirdpart libs
@@ -505,6 +570,10 @@ def copy_scripts_and_libs():
     must_copy(os.path.join(scripts_srcdir, 'seahub.sh'),
               serverdir)
     must_copy(os.path.join(scripts_srcdir, 'reset-admin.sh'),
+              serverdir)
+    must_copy(os.path.join(scripts_srcdir, 'seaf-fuse.sh'),
+              serverdir)
+    must_copy(os.path.join(scripts_srcdir, 'check_init_admin.py'),
               serverdir)
 
     # copy update scripts
@@ -532,9 +601,39 @@ def copy_scripts_and_libs():
     # copy seahub thirdpart libs
     seahub_thirdpart = os.path.join(dst_seahubdir, 'thirdpart')
     copy_seahub_thirdpart_libs(seahub_thirdpart)
+    copy_seafdav()
+
+
+    # copy_pdf2htmlex()
 
     # copy shared c libs
     copy_shared_libs()
+    copy_user_manuals()
+
+def copy_pdf2htmlex():
+    '''Copy pdf2htmlEX exectuable and its dependent libs'''
+    pdf2htmlEX_executable = find_in_path('pdf2htmlEX')
+    libs = get_dependent_libs(pdf2htmlEX_executable)
+
+    builddir = conf[CONF_BUILDDIR]
+    dst_lib_dir = os.path.join(builddir,
+                               'seafile-server',
+                               'seafile',
+                               'lib')
+
+    dst_bin_dir = os.path.join(builddir,
+                               'seafile-server',
+                               'seafile',
+                               'bin')
+
+    for lib in libs:
+        dst_file = os.path.join(dst_lib_dir, os.path.basename(lib))
+        if os.path.exists(dst_file):
+            continue
+        info('Copying %s' % lib)
+        must_copy(lib, dst_lib_dir)
+
+    must_copy(pdf2htmlEX_executable, dst_bin_dir)
 
 def get_dependent_libs(executable):
     syslibs = ['libsearpc', 'libccnet', 'libseafile', 'libpthread.so', 'libc.so', 'libm.so', 'librt.so', 'libdl.so', 'libselinux.so', 'libresolv.so' ]
@@ -545,7 +644,7 @@ def get_dependent_libs(executable):
         return False
 
     ldd_output = commands.getoutput('ldd %s' % executable)
-    ret = []
+    ret = set()
     for line in ldd_output.splitlines():
         tokens = line.split()
         if len(tokens) != 4:
@@ -553,7 +652,7 @@ def get_dependent_libs(executable):
         if is_syslib(tokens[0]):
             continue
 
-        ret.append(tokens[2])
+        ret.add(tokens[2])
 
     return ret
 
@@ -566,11 +665,11 @@ def copy_shared_libs():
                            'seafile',
                            'lib')
 
-    httpserver_path = os.path.join(builddir,
+    fileserver_path = os.path.join(builddir,
                                    'seafile-server',
                                    'seafile',
                                    'bin',
-                                   'httpserver')
+                                   'fileserver')
 
     ccnet_server_path = os.path.join(builddir,
                                      'seafile-server',
@@ -578,15 +677,21 @@ def copy_shared_libs():
                                      'bin',
                                      'ccnet-server')
 
-    httpserver_libs = get_dependent_libs(httpserver_path)
-    ccnet_server_libs = get_dependent_libs(ccnet_server_path)
+    seaf_fuse_path = os.path.join(builddir,
+                                  'seafile-server',
+                                  'seafile',
+                                  'bin',
+                                  'seaf-fuse')
 
-    libs = httpserver_libs
-    for lib in ccnet_server_libs:
-        if lib not in libs:
-            libs.append(lib)
+    libs = set()
+    libs.update(get_dependent_libs(ccnet_server_path))
+    libs.update(get_dependent_libs(fileserver_path))
+    libs.update(get_dependent_libs(seaf_fuse_path))
 
     for lib in libs:
+        dst_file = os.path.join(dst_dir, os.path.basename(lib))
+        if os.path.exists(dst_file):
+            continue
         info('Copying %s' % lib)
         shutil.copy(lib, dst_dir)
 
@@ -699,7 +804,9 @@ def gen_tarball():
     # 32-bit: seafile-server_1.2.2_i386.tar.gz
     version = conf[CONF_VERSION]
     arch = os.uname()[-1].replace('_', '-')
-    if arch != 'x86-64':
+    if 'arm' in platform.machine():
+        arch = 'pi'
+    elif arch != 'x86-64':
         arch = 'i386'
 
     dbg = ''

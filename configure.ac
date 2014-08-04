@@ -2,7 +2,7 @@ dnl Process this file with autoconf to produce a configure script.
 
 
 AC_PREREQ(2.61)
-AC_INIT([seafile], [2.0.6], [freeplant@gmail.com])
+AC_INIT([seafile], [3.1.0], [freeplant@gmail.com])
 AC_CONFIG_HEADER([config.h])
 
 AC_CONFIG_MACRO_DIR([m4])
@@ -43,7 +43,7 @@ else
 fi
 
 AC_MSG_CHECKING(for Mac)
-if test "$TERM_PROGRAM" = "Apple_Terminal"; then
+if test "$(uname)" = "Darwin"; then
   bmac=true
   AC_MSG_RESULT(compile in mac)
 else
@@ -87,11 +87,8 @@ if test "$blinux" = true; then
    AC_ARG_ENABLE(riak, AC_HELP_STRING([--enable-riak], [enable riak backend]),
       [compile_riak=$enableval],[compile_riak="no"])
 
-   AC_ARG_ENABLE(ceph, AC_HELP_STRING([--enable-ceph], [enable ceph backend]),
-      [compile_ceph=$enableval],[compile_ceph="no"])
-
-   AC_ARG_ENABLE(gnome-keyring, AC_HELP_STRING([--enable-gnome-keyring], [enable gnome keyring support]),
-      [compile_gnome_keyring=$enableval],[compile_gnome_keyring="no"])
+   AC_ARG_ENABLE(fuse, AC_HELP_STRING([--enable-fuse], [enable fuse virtual file system]),
+      [compile_fuse=$enableval],[compile_fuse="yes"])
 fi
 
 AC_ARG_ENABLE(client, AC_HELP_STRING([--enable-client], [enable client]),
@@ -145,7 +142,7 @@ AM_CONDITIONAL([COMPILE_CLIENT], [test "${compile_client}" = "yes"])
 AM_CONDITIONAL([COMPILE_SERVER], [test "${compile_server}" = "yes"])
 #AM_CONDITIONAL([COMPILE_SEABLOCK], [test "${compile_seablock}" = "yes"])
 AM_CONDITIONAL([COMPILE_RIAK], [test "${compile_riak}" = "yes"])
-AM_CONDITIONAL([COMPILE_CEPH], [test "${compile_ceph}" = "yes"])
+AM_CONDITIONAL([COMPILE_FUSE], [test "${compile_fuse}" = "yes"])
 
 AM_CONDITIONAL([WIN32], [test "$bwin32" = "true"])
 AM_CONDITIONAL([MACOS], [test "$bmac" = "true"])
@@ -195,6 +192,7 @@ if test "$bwin32" = true; then
   LIB_IPHLPAPI=-liphlpapi
   LIB_SHELL32=-lshell32
   LIB_PSAPI=-lpsapi
+  LIB_MAC=
   MSVC_CFLAGS="-D__MSVCRT__ -D__MSVCRT_VERSION__=0x0601"
 elif test "$bmac" = true ; then
   LIB_WS32=
@@ -207,6 +205,7 @@ elif test "$bmac" = true ; then
   LIB_SHELL32=
   LIB_PSAPI=
   MSVC_CFLAGS=
+  LIB_MAC="-framework CoreServices"
 else
   LIB_WS32=
   LIB_GDI32=
@@ -217,6 +216,7 @@ else
   LIB_IPHLPAPI=
   LIB_SHELL32=
   LIB_PSAPI=
+  LIB_MAC=
   MSVC_CFLAGS=
 fi
 
@@ -229,18 +229,20 @@ AC_SUBST(LIB_UUID)
 AC_SUBST(LIB_IPHLPAPI)
 AC_SUBST(LIB_SHELL32)
 AC_SUBST(LIB_PSAPI)
+AC_SUBST(LIB_MAC)
 AC_SUBST(MSVC_CFLAGS)
 
 
-# gtk and glib
-APPINDICATOR_REQUIRED=0.0.7
+LIBEVENT_REQUIRED=2.0
 GLIB_REQUIRED=2.16.0
-GTK_REQUIRED=2.16.0
 CCNET_REQUIRED=0.9.3
 SEARPC_REQUIRED=1.0
+JANSSON_REQUIRED=2.2.1
 ZDB_REQUIRED=2.10
 #LIBNAUTILUS_EXTENSION_REQUIRED=2.30.1
 CURL_REQUIRED=7.17
+FUSE_REQUIRED=2.8.6
+ZLIB_REQUIRED=1.2.0
 
 PKG_CHECK_MODULES(GLIB2, [glib-2.0 >= $GLIB_REQUIRED])
 AC_SUBST(GLIB2_CFLAGS)
@@ -258,22 +260,17 @@ PKG_CHECK_MODULES(SEARPC, [libsearpc >= $SEARPC_REQUIRED])
 AC_SUBST(SEARPC_CFLAGS)
 AC_SUBST(SEARPC_LIBS)
 
-AC_ARG_ENABLE(appindicator,
-   AC_HELP_STRING([--enable-appindicator[=@<:@no/auto/yes@:>@]],[Build support for application indicators ]),
-   [enable_appindicator=$enableval],
-   [enable_appindicator="auto"])
+PKG_CHECK_MODULES(JANSSON, [jansson >= $JANSSON_REQUIRED])
+AC_SUBST(JANSSON_CFLAGS)
+AC_SUBST(JANSSON_LIBS)
 
-if test x$enable_appindicator = xyes ; then
-   PKG_CHECK_EXISTS([appindicator-0.1 >= $APPINDICATOR_REQUIRED],,
-                   AC_MSG_ERROR([appindicator-0.1 is not installed]))
-   PKG_CHECK_MODULES(APP_INDICATOR,
-                    appindicator-0.1 >= $APPINDICATOR_REQUIRED)
-   AC_SUBST(APP_INDICATOR_CFLAGS)
-   AC_SUBST(APP_INDICATOR_LIBS)
-   AC_DEFINE(HAVE_APP_INDICATOR, 1, [Have AppIndicator])
-fi
+PKG_CHECK_MODULES(LIBEVENT, [libevent >= $LIBEVENT_REQUIRED])
+AC_SUBST(LIBEVENT_CFLAGS)
+AC_SUBST(LIBEVENT_LIBS)
 
-AM_CONDITIONAL(HAVE_APP_INDICATOR, [test x"$enable_appindicator" = xyes])
+PKG_CHECK_MODULES(ZLIB, [zlib >= $ZLIB_REQUIRED])
+AC_SUBST(ZLIB_CFLAGS)
+AC_SUBST(ZLIB_LIBS)
 
 if test x${compile_python} = xyes; then
    AM_PATH_PYTHON([2.6])
@@ -295,7 +292,12 @@ if test "${compile_server}" = "yes"; then
    PKG_CHECK_MODULES(ZDB, [zdb >= $ZDB_REQUIRED])
    AC_SUBST(ZDB_CFLAGS)
    AC_SUBST(ZDB_LIBS)
+fi
 
+if test "${compile_fuse}" = "yes"; then
+   PKG_CHECK_MODULES(FUSE, [fuse >= $FUSE_REQUIRED])
+   AC_SUBST(FUSE_CFLAGS)
+   AC_SUBST(FUSE_LIBS)
 fi
 
 if test x${compile_server} = xyes; then
@@ -314,15 +316,6 @@ if test "${compile_riak}" = "yes"; then
    AC_DEFINE([RIAK_BACKEND], [1], ["define if support Riak backend"])
 fi
 
-if test "${compile_ceph}" = "yes"; then
-   AC_CHECK_LIB(rados, rados_create, [with_rados=yes],
-       AC_MSG_ERROR([*** Unable to find librados]), )
-   echo "found rados"
-   RADOS_LIBS="-lrados"
-   AC_SUBST(RADOS_LIBS)
-   AC_DEFINE([HAVE_RADOS], [1], ["define if have rados"])
-fi
-
 AM_CONDITIONAL([HAVE_KEYSTORAGE_GK], [test "${compile_gnome_keyring}" = "yes"])
 if test "${compile_gnome_keyring}" = "yes"; then
    PKG_CHECK_MODULES(GNOME_KEYRING, [gnome-keyring-1])
@@ -336,15 +329,7 @@ ac_configure_args="$ac_configure_args -q"
 AC_CONFIG_FILES(
     Makefile
     include/Makefile
-    data/Makefile
-    data/icons/Makefile
-    data/icons/16x16/Makefile
-    data/icons/22x22/Makefile
-    data/icons/24x24/Makefile
-    data/icons/32x32/Makefile
-    data/icons/48x48/Makefile
-    data/icons/128x128/Makefile
-    data/icons/scalable/Makefile
+    fuse/Makefile
     lib/Makefile
     lib/libseafile.pc
     common/Makefile
@@ -358,7 +343,7 @@ AC_CONFIG_FILES(
     python/seafile/Makefile
     python/seaserv/Makefile
     controller/Makefile
-    httpserver/Makefile
+    fileserver/Makefile
     tools/Makefile
     tests/Makefile
     tests/common-conf.sh

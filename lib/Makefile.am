@@ -14,7 +14,7 @@ BUILT_SOURCES = gensource
 
 ## source file rules
 seafile_object_define = repo.vala commit.vala dirent.vala dir.vala \
-	task.vala branch.vala crypt.vala webaccess.vala
+	task.vala branch.vala crypt.vala webaccess.vala copy-task.vala
 
 seafile_object_gen = $(seafile_object_define:.vala=.c)
 
@@ -55,7 +55,8 @@ libseafile_common_la_SOURCES = ${seafile_object_gen} ${utils_srcs}
 libseafile_common_la_LDFLAGS = -no-undefined
 libseafile_common_la_LIBADD = @GLIB2_LIBS@  @GOBJECT_LIBS@ -lssl -lcrypto @LIB_GDI32@ \
 				     @LIB_UUID@ @LIB_WS32@ @LIB_PSAPI@ -lsqlite3 \
-					 -levent @SEARPC_LIBS@ @LIB_SHELL32@
+					 -levent @SEARPC_LIBS@ @LIB_SHELL32@ \
+	@ZLIB_LIBS@
 
 searpc_gen = searpc-signature.h searpc-marshal.h
 
@@ -72,7 +73,7 @@ clean-local:
 
 install-data-local:
 if MACOS
-	${SED} -i '' -e "s|(DESTDIR)|${DESTDIR}|g" $(pcfiles)
+	sed -i '' -e "s|(DESTDIR)|${DESTDIR}|g" $(pcfiles)
 else
 	${SED} -i "s|(DESTDIR)|${DESTDIR}|g" $(pcfiles)
 endif

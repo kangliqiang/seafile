@@ -30,9 +30,11 @@ struct stage_data
     struct
     {
         unsigned mode;
-        unsigned int ctime;
-        unsigned int mtime;
+        guint64 ctime;
+        guint64 mtime;
+        guint64 current_mtime;
         unsigned char sha[20];
+        char *modifier;
     } stages[4];
     unsigned processed:1;
 };
@@ -50,8 +52,11 @@ static void output(struct merge_options *o, const char *fmt, ...)
 }
 #endif
 
-static int add_cacheinfo(struct index_state *index, unsigned int mode, const unsigned char *sha1,
-                         const char *path, const char *full_path, int stage, int refresh, int options)
+static int add_cacheinfo(struct index_state *index,
+                         unsigned int mode, const unsigned char *sha1,
+                         const char *modifier,
+                         const char *path, const char *full_path,
+                         int stage, int refresh, int options)
 {
     struct cache_entry *ce;
     ce = make_cache_entry(mode, sha1, path, full_path, stage, refresh);
@@ -59,6 +64,7 @@ static int add_cacheinfo(struct index_state *index, unsigned int mode, const uns
         g_warning("addinfo_cache failed for path '%s'", path);
         return -1;
     }
+    ce->modifier = g_strdup(modifier);
     return add_index_entry(index, ce, options);
 }
 
@@ -73,6 +79,8 @@ static int seafile_merge_trees(struct merge_options *o,
     struct tree_desc t[3];
 
     memset(opts, 0, sizeof(*opts));
+    memcpy (opts->repo_id, o->repo_id, 36);
+    opts->version = o->version;
     if (o->call_depth)
         opts->index_only = 1;
     else
@@ -86,9 +94,9 @@ static int seafile_merge_trees(struct merge_options *o,
     if (o->crypt)
         opts->crypt = o->crypt;
 
-    fill_tree_descriptor(t+0, common->dir_id);
-    fill_tree_descriptor(t+1, head->dir_id);
-    fill_tree_descriptor(t+2, merge->dir_id);
+    fill_tree_descriptor(o->repo_id, o->version, t+0, common->dir_id);
+    fill_tree_descriptor(o->repo_id, o->version, t+1, head->dir_id);
+    fill_tree_descriptor(o->repo_id, o->version, t+2, merge->dir_id);
 
     rc = unpack_trees(3, t, opts);
 
@@ -97,7 +105,7 @@ static int seafile_merge_trees(struct merge_options *o,
         *(o->index) = opts->result;
 
         if (o->collect_blocks_only)
-            collect_new_blocks_from_index (o->index, o->bl);
+            collect_new_blocks_from_index (o->repo_id, o->version, o->index, o->bl);
     }
 
     tree_desc_free (t);
@@ -127,7 +135,9 @@ char *write_tree_from_memory(struct merge_options *o)
     /* if (!active_cache_tree) */
     it = cache_tree();
 
-    if (cache_tree_update(it, o->index->cache, o->index->cache_nr, 
+    if (cache_tree_update(o->repo_id, o->version,
+                          o->worktree, 
+                          it, o->index->cache, o->index->cache_nr, 
                           0, 0, commit_trees_cb) < 0) {
         g_warning("error building trees");
         cache_tree_free (&it);
@@ -170,13 +180,16 @@ static int get_files_dirs_recursive(struct merge_options *o, SeafDir *tree,
 
             snprintf(base + baselen, SEAF_PATH_MAX, "%s/", dent->name);
             new_baselen = baselen + dent->name_len + 1;
-            subdir = seaf_fs_manager_get_seafdir(seaf->fs_mgr, dent->id);
+            subdir = seaf_fs_manager_get_seafdir(seaf->fs_mgr,
+                                                 o->repo_id, o->version,
+                                                 dent->id);
             if (!subdir) {
                 g_warning("Failed to get dir %s\n", dent->id);
                 return -1;
             }
             ret = get_files_dirs_recursive(o, subdir, base, new_baselen);
             base[baselen] = 0;
+            seaf_dir_free (subdir);
             break;
         case S_IFLNK:
             break;
@@ -230,8 +243,10 @@ static GList *get_unmerged(struct index_state *index)
 
         e->stages[ce_stage(ce)].ctime = ce->ce_ctime.sec;
         e->stages[ce_stage(ce)].mtime = ce->ce_mtime.sec;
+        e->stages[ce_stage(ce)].current_mtime = ce->current_mtime;
         e->stages[ce_stage(ce)].mode = ce->ce_mode;
         hashcpy(e->stages[ce_stage(ce)].sha, ce->sha1);
+        e->stages[ce_stage(ce)].modifier = g_strdup(ce->modifier);
     }
     unmerged = g_list_reverse(unmerged);
 
@@ -299,7 +314,7 @@ static void make_room_for_directories_of_df_conflicts(struct merge_options *o,
 #endif
 
 static int
-remove_path (const char *worktree, const char *name, unsigned int ctime, unsigned int mtime)
+remove_path (const char *worktree, const char *name, guint64 mtime)
 {
     char *slash;
     char *path;
@@ -315,7 +330,7 @@ remove_path (const char *worktree, const char *name, unsigned int ctime, unsigne
 
     if (S_ISREG (st.st_mode)) {
         /* file has been changed. */
-        if (ctime != st.st_ctime || mtime != st.st_mtime) {
+        if (mtime != st.st_mtime) {
             g_free (path);
             return -1;
         }
@@ -326,6 +341,7 @@ remove_path (const char *worktree, const char *name, unsigned int ctime, unsigne
         }
     } else if (S_ISDIR (st.st_mode)) {
         if (seaf_remove_empty_dir (path) < 0) {
+            g_warning ("Failed to remove %s: %s.\n", path, strerror(errno));
             g_free (path);
             return -1;
         }
@@ -339,7 +355,7 @@ remove_path (const char *worktree, const char *name, unsigned int ctime, unsigne
         do {
             *slash = '\0';
         } while (strcmp (worktree, path) != 0 &&
-                 g_rmdir (path) == 0 &&
+                 seaf_remove_empty_dir (path) == 0 &&
                  (slash = strrchr (path, '/')));
     }
 
@@ -349,7 +365,7 @@ remove_path (const char *worktree, const char *name, unsigned int ctime, unsigne
 
 static int remove_file(struct merge_options *o, int clean,
                        const char *path, int no_wd,
-                       unsigned int ctime, unsigned int mtime)
+                       guint64 mtime)
 {
     int update_cache = o->call_depth || clean;
     int update_working_directory = !o->call_depth && !no_wd;
@@ -362,7 +378,7 @@ static int remove_file(struct merge_options *o, int clean,
             return -1;
     }
     if (update_working_directory) {
-        if (remove_path(o->worktree, path, ctime, mtime) < 0)
+        if (remove_path(o->worktree, path, mtime) < 0)
             return -1;
     }
     return 0;
@@ -438,7 +454,7 @@ static int create_leading_directories(int base_len,
 
             strftime(time_buf, 64, "%Y-%m-%d-%H-%M-%S", localtime(&t));
             n = snprintf (&buf[my_offset], SEAF_PATH_MAX - my_offset,
-                          " (%s %s)", conflict_suffix, time_buf);
+                          " (%s)", time_buf);
             my_offset += n;
             if (seaf_stat (buf, &st) == 0 && S_ISDIR(st.st_mode))
                 continue;
@@ -500,6 +516,8 @@ static int make_room_for_path(struct index_state *index, const char *path,
 static int update_file_flags(struct merge_options *o,
                              const unsigned char *sha,
                              unsigned mode,
+                             const char *modifier,
+                             guint64 mtime,
                              const char *path,
                              int update_cache,
                              int update_wd)
@@ -507,9 +525,10 @@ static int update_file_flags(struct merge_options *o,
     char *real_path;
     char file_id[41];
     int clean = 1;
+    int refresh = 1;
 
     if (update_wd && o->collect_blocks_only) {
-        fill_seafile_blocks (sha, o->bl);
+        fill_seafile_blocks (o->repo_id, o->version, sha, o->bl);
         return clean;
     }
 
@@ -518,7 +537,6 @@ static int update_file_flags(struct merge_options *o,
     if (update_wd) {
         char *new_path;
         SeafStat st;
-        char *conflict_suffix;
 
         /* When creating a conflict directory, we use o->branch2 as conflict
          * suffix instead of the last changer name of path.
@@ -528,7 +546,8 @@ static int update_file_flags(struct merge_options *o,
         if (make_room_for_path(o->index, path, real_path, 
                                &new_path, o->branch2, &clean) < 0) {
             g_free (real_path);
-            return clean;
+            refresh = 0;
+            goto update_cache;
         }
         g_free (real_path);
         real_path = new_path;
@@ -537,9 +556,10 @@ static int update_file_flags(struct merge_options *o,
         if (S_ISDIR (mode)) {
             if (g_mkdir (real_path, 0777) < 0) {
                 g_warning ("Failed to create empty dir %s in merge.\n", real_path);
-                g_free (real_path);
-                return 0;
+                refresh = 0;
             }
+            if (mtime != 0 && seaf_set_file_time (real_path, mtime) < 0)
+                g_warning ("Failed to set mtime for %s.\n", real_path);
             goto update_cache;
         }
 
@@ -549,7 +569,7 @@ static int update_file_flags(struct merge_options *o,
         if (update_cache && o->recover_merge && 
             seaf_stat(real_path, &st) == 0 && S_ISREG(st.st_mode)) {
             if (compare_file_content (real_path, &st, sha, 
-                                      o->crypt) == 0) {
+                                      o->crypt, o->version) == 0) {
                 goto update_cache;
             }
             /* If the file was checked out and changed by user, we
@@ -560,31 +580,30 @@ static int update_file_flags(struct merge_options *o,
             return clean;
         }
 
-        conflict_suffix = get_last_changer_of_file (o->remote_head, path);
-        if (!conflict_suffix)
-            conflict_suffix = g_strdup(o->branch2);
-
-        gboolean conflicted;
+        gboolean conflicted = FALSE;
         rawdata_to_hex(sha, file_id, 20);
         if (seaf_fs_manager_checkout_file(seaf->fs_mgr, 
+                                          o->repo_id,
+                                          o->version,
                                           file_id,
                                           real_path,
                                           mode,
+                                          mtime,
                                           o->crypt,
-                                          conflict_suffix,
+                                          o->remote_head,
+                                          path,
                                           FALSE,
                                           &conflicted) < 0) {
             g_warning("Failed to checkout file %s.\n", file_id);
-            g_free(real_path);
-            g_free (conflict_suffix);
-            return clean;
+            refresh = 0;
+            goto update_cache;
         }
-        g_free (conflict_suffix);
     }
 
 update_cache:
-    if (update_cache)
-        add_cacheinfo(o->index, mode, sha, path, real_path, 0, update_wd, ADD_CACHE_OK_TO_ADD);
+    if (update_cache && clean)
+        add_cacheinfo(o->index, mode, sha, modifier,
+                      path, real_path, 0, refresh, ADD_CACHE_OK_TO_ADD);
     g_free(real_path);
 
     return clean;
@@ -594,21 +613,11 @@ static int update_file(struct merge_options *o,
                        int clean,
                        const unsigned char *sha,
                        unsigned mode,
+                       const char *modifier,
+                       guint64 mtime,
                        const char *path)
 {
-    return update_file_flags(o, sha, mode, path, clean, 1);
-}
-
-static void handle_delete_modify(struct merge_options *o,
-                                 const char *path,
-                                 const char *new_path,
-                                 unsigned char *a_sha, int a_mode,
-                                 unsigned char *b_sha, int b_mode)
-{
-    /* Only need to checkout other's version if I deleted the file. */
-    if (!a_sha) {
-        update_file(o, 0, b_sha, b_mode, new_path);
-    }
+    return update_file_flags(o, sha, mode, modifier, mtime, path, clean, 1);
 }
 
 /* Per entry merge function */
@@ -627,8 +636,11 @@ static int process_entry(struct merge_options *o,
     unsigned char *o_sha = o_mode ? entry->stages[1].sha : NULL;
     unsigned char *a_sha = a_mode ? entry->stages[2].sha : NULL;
     unsigned char *b_sha = b_mode ? entry->stages[3].sha : NULL;
-    unsigned int a_ctime = entry->stages[2].ctime;
-    unsigned int a_mtime = entry->stages[2].mtime;
+    guint64 current_mtime = entry->stages[2].current_mtime;
+    guint64 a_mtime = entry->stages[2].mtime;
+    guint64 b_mtime = entry->stages[3].mtime;
+    char *a_modifier = entry->stages[2].modifier;
+    char *b_modifier = entry->stages[3].modifier;
 
     /* if (entry->rename_df_conflict_info) */
     /*  return 1; /\* Such cases are handled elsewhere. *\/ */
@@ -643,7 +655,7 @@ static int process_entry(struct merge_options *o,
              * unchanged in the other */
             /* do not touch working file if it did not exist */
             /* do not remove working file if it's changed. */
-            remove_file(o, 1, path, !a_sha, a_ctime, a_mtime);
+            remove_file(o, 1, path, !a_sha, current_mtime);
         } else if (g_hash_table_lookup(o->current_directory_set,
                                        path)) {
             /* file -> (file, directory), the file side. */
@@ -652,9 +664,11 @@ static int process_entry(struct merge_options *o,
         } else {
             /* Deleted in one and changed in the other */
             /* or directory -> (file, directory), directory side */
-            clean_merge = 0;
-            handle_delete_modify(o, path, path,
-                                 a_sha, a_mode, b_sha, b_mode);
+            /* Don't consider as unclean. */
+            if (!a_sha)
+                clean_merge = update_file(o, 1, b_sha, b_mode, b_modifier, b_mtime, path);
+            else
+                update_file_flags (o, a_sha, a_mode, a_modifier, a_mtime, path, 1, 0);
         }
 
     } else if ((!o_sha && a_sha && !b_sha) ||
@@ -668,53 +682,84 @@ static int process_entry(struct merge_options *o,
             /* Added in one */
             /* or file -> (file, directory), directory side */
             if (b_sha)
-                clean_merge = update_file(o, 1, b_sha, b_mode, path);
+                clean_merge = update_file(o, 1, b_sha, b_mode, b_modifier, b_mtime, path);
             else
                 /* For my file, just set index entry to stage 0,
                  * without updating worktree. */
-                update_file_flags (o, a_sha, a_mode, path, 1, 0);
+                update_file_flags (o, a_sha, a_mode, a_modifier, a_mtime, path, 1, 0);
         }
     } else if (a_sha && b_sha) {
         /* Case C: Added in both (check for same permissions) and */
         /* case D: Modified in both, but differently. */
         if (memcmp(a_sha, b_sha, 20) != 0 || a_mode != b_mode) {
             char *new_path = NULL;
-            char *conflict_suffix = NULL;
 
             clean_merge = 0;
-            if (S_ISDIR (b_mode))
-                goto out;
 
             if (!o->collect_blocks_only) {
-                conflict_suffix = get_last_changer_of_file (o->remote_head, path);
-                if (!conflict_suffix)
-                    conflict_suffix = g_strdup(o->branch2);
-                new_path = gen_conflict_path (path, conflict_suffix);
+                new_path = gen_conflict_path_wrapper (o->repo_id, o->version,
+                                                      o->remote_head, path,
+                                                      path);
+                if (!new_path)
+                    new_path = gen_conflict_path(path,
+                                                 o->branch2,
+                                                 (gint64)time(NULL));
             }
 
             /* Dont update index. */
             /* Keep my version, rename other's version. */
-            update_file_flags(o, b_sha, b_mode, new_path, 0, 1);
+            update_file_flags(o, b_sha, b_mode, b_modifier, b_mtime, new_path, 0, 1);
             g_free (new_path);
-            g_free (conflict_suffix);
         } else {
-            update_file_flags (o, a_sha, b_mode, path, 1, 0);
+            update_file_flags (o, a_sha, a_mode, a_modifier, a_mtime, path, 1, 0);
         }
     } else if (!o_sha && !a_sha && !b_sha) {
         /*
          * this entry was deleted altogether. a_mode == 0 means
          * we had that path and want to actively remove it.
          */
-        remove_file(o, 1, path, !a_mode, a_ctime, a_mtime);
+        remove_file(o, 1, path, !a_mode, current_mtime);
     } else
         g_error("Fatal merge failure, shouldn't happen.");
 
-out:
     return clean_merge;
 }
 
+static int is_garbage_empty_dir (struct index_state *index, const char *name)
+{
+    int pos = index_name_pos (index, name, strlen(name));
+
+    /*
+     * If pos >= 0, ++pos to the next entry in the index.
+     * If pos < 0, -pos = (the position this entry *should* be) + 1.
+     * So -pos-1 is the first entry larger than this entry.
+     */
+    if (pos >= 0)
+        pos++;
+    else
+        pos = -pos-1;
+
+    struct cache_entry *next;
+    int this_len = strlen (name);
+    while (pos < index->cache_nr) {
+        next = index->cache[pos];
+
+        /* If 'name' is the prefix of next->name but they are unequal,
+         * it means there are entries under this empty dir. So this "emtpy dir"
+         * is useless.
+         */
+        if (strncmp (name, next->name, this_len) != 0)
+            break;
+        if (strcmp (name, next->name) != 0)
+            return 1;
+        ++pos;
+    }
+
+    return 0;
+}
+
 /*
- * Per entry merge function for D/F (and/or rename) conflicts.  In the
+ * per entry merge function for D/F (and/or rename) conflicts.  In the
  * cases we can cleanly resolve D/F conflicts, process_entry() can
  * clean out all the files below the directory for us.  All D/F
  * conflict cases must be handled here at the end to make sure any
@@ -731,66 +776,95 @@ static int process_df_entry(struct merge_options *o,
     unsigned char *o_sha = o_mode ? entry->stages[1].sha : NULL;
     unsigned char *a_sha = a_mode ? entry->stages[2].sha : NULL;
     unsigned char *b_sha = b_mode ? entry->stages[3].sha : NULL;
+    guint64 a_mtime = entry->stages[2].mtime;
+    guint64 b_mtime = entry->stages[3].mtime;
+    char *a_modifier = entry->stages[2].modifier;
+    char *b_modifier = entry->stages[3].modifier;
     SeafStat st;
     char *real_path = g_build_path(PATH_SEPERATOR, o->worktree, path, NULL);
     char *new_path = NULL;
-    char *conflict_suffix = NULL;
 
     entry->processed = 1;
     if (o_sha && (!a_sha || !b_sha)) {
-        clean_merge = 0;
         /* Modify/delete; deleted side may have put a directory in the way */
         if (b_sha) {
             if (seaf_stat (real_path, &st) == 0 && S_ISDIR(st.st_mode)) {
                 /* D/F conflict. */
-                /* If b is an empty dir, don't check it out. */
-                if (S_ISDIR(b_mode))
-                    goto out;
+                clean_merge = 0;
 
                 if (!o->collect_blocks_only) {
-                    conflict_suffix = get_last_changer_of_file (o->remote_head,
-                                                                path);
-                    if (!conflict_suffix)
-                        conflict_suffix = g_strdup(o->branch2);
-                    new_path = gen_conflict_path (path, conflict_suffix);
+                    new_path = gen_conflict_path_wrapper (o->repo_id, o->version,
+                                                          o->remote_head, path,
+                                                          path);
+                    if (!new_path)
+                        new_path = gen_conflict_path(path,
+                                                     o->branch2,
+                                                     (gint64)time(NULL));
                 }
 
-                update_file(o, 0, b_sha, b_mode, new_path);
+                update_file(o, 0, b_sha, b_mode, b_modifier, b_mtime, new_path);
                 g_free (new_path);
-                g_free (conflict_suffix);
             } else {
-                /* Modify/Delete conflict. */
-                update_file(o, 0, b_sha, b_mode, path);
+                /* Modify/Delete conflict. Don't consider as unclean. */
+                clean_merge = update_file(o, 1, b_sha, b_mode, b_modifier, b_mtime, path);
+            }
+        } else {
+            if (seaf_stat (real_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                clean_merge = 0;
+            } else {
+                /* Clean merge. Just need to update index. */
+                update_file_flags (o, a_sha, a_mode, a_modifier, a_mtime, path, 1, 0);
             }
         }
-        /* If the conflicting file is mine, it's already in the work tree.
-         * And the conflicting dir should have proper suffix.
-         * So nothing need to be processed here.
-         */
     } else if (!o_sha && !!a_sha != !!b_sha) {
+        unsigned char *sha = a_sha ? a_sha : b_sha;
+        unsigned mode = a_sha ? a_mode : b_mode;
+        char *modifier = a_sha ? a_modifier : b_modifier;
+        guint64 mtime = a_sha ? a_mtime : b_mtime;
+
+        /* directory -> (directory, empty dir) or
+         * directory -> (empty dir, directory) */
+        if (S_ISDIR(mode)) {
+            /* Merge is always clean. If the merge result is non empty dir,
+             * remove the empty dir entry from the index.
+             */
+            if (is_garbage_empty_dir (o->index, path))
+                remove_file_from_index (o->index, path);
+            else if (a_sha)
+                update_file_flags (o, sha, mode, modifier, mtime, path, 1, 0);
+            else
+                update_file_flags (o, sha, mode, modifier, mtime, path, 1, 1);
+            goto out;
+        }
+
         /* directory -> (directory, file) */
         if (b_sha) {
             if (seaf_stat (real_path, &st) == 0 && S_ISDIR(st.st_mode)) {
                 /* D/F conflict. */
                 clean_merge = 0;
 
-                if (S_ISDIR (b_mode))
-                    goto out;
-
                 if (!o->collect_blocks_only) {
-                    conflict_suffix = get_last_changer_of_file (o->remote_head,
-                                                                path);
-                    if (!conflict_suffix)
-                        conflict_suffix = g_strdup(o->branch2);
-                    new_path = gen_conflict_path (path, conflict_suffix);
+                    new_path = gen_conflict_path_wrapper (o->repo_id, o->version,
+                                                          o->remote_head, path,
+                                                          path);
+                    if (!new_path)
+                        new_path = gen_conflict_path(path,
+                                                     o->branch2,
+                                                     (gint64)time(NULL));
                 }
 
-                update_file(o, 0, b_sha, b_mode, new_path);
+                update_file(o, 0, b_sha, b_mode, b_modifier, b_mtime, new_path);
                 g_free (new_path);
-                g_free (conflict_suffix);
             } else {
                 /* Clean merge. */
-                clean_merge = update_file(o, 1, b_sha, b_mode, path);
+                clean_merge = update_file(o, 1, b_sha, b_mode, b_modifier, b_mtime, path);
+            }
+        } else {
+            if (seaf_stat (real_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                clean_merge = 0;
+            } else {
+                /* Clean merge. Just need to update index. */
+                update_file_flags (o, a_sha, a_mode, a_modifier, a_mtime, path, 1, 0);
             }
         }
     } else {
@@ -808,13 +882,13 @@ out:
 static void
 print_index (struct index_state *istate)
 {
-    printf ("Totally %u entries in index.\n", istate->cache_nr);
+    g_message ("Totally %u entries in index.\n", istate->cache_nr);
     int i;
     char id[41];
     for (i = 0; i < istate->cache_nr; ++i) {
         struct cache_entry *ce = istate->cache[i];
         rawdata_to_hex (ce->sha1, id, 20);
-        printf ("%s\t%s\t%o\t%d\t%d\t%d\n", ce->name, id, ce->ce_mode, ce_stage(ce),
+        g_message ("%s\t%s\t%o\t%d\t%d\t%d\n", ce->name, id, ce->ce_mode, ce_stage(ce),
                 ce->ce_ctime.sec, ce->ce_mtime.sec);
     }
 
@@ -857,6 +931,9 @@ process_unmerged_entries (struct merge_options *o,
                 return 0;
             }
             g_free(e->path);
+            int i;
+            for (i = 0; i < 4; ++i)
+                g_free (e->stages[i].modifier);
             free(e);
         }
         g_list_free(entries);
@@ -884,9 +961,9 @@ int merge_recursive(struct merge_options *o,
 
     *clean = 1;
 
-    head = seaf_fs_manager_get_seafdir (seaf->fs_mgr, h1_root);
-    remote = seaf_fs_manager_get_seafdir (seaf->fs_mgr, h2_root);
-    common = seaf_fs_manager_get_seafdir (seaf->fs_mgr, ca_root);
+    head = seaf_fs_manager_get_seafdir (seaf->fs_mgr, o->repo_id, o->version, h1_root);
+    remote = seaf_fs_manager_get_seafdir (seaf->fs_mgr, o->repo_id, o->version, h2_root);
+    common = seaf_fs_manager_get_seafdir (seaf->fs_mgr, o->repo_id, o->version, ca_root);
     if (!head || !remote || !common) {
         g_warning ("Invalid commits!\n");
         return -1;

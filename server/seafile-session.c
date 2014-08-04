@@ -17,7 +17,7 @@
 #include <glib.h>
 
 #include <ccnet/cevent.h>
-#include <utils.h>
+#include "utils.h"
 
 #include "seafile-session.h"
 
@@ -25,6 +25,8 @@
 
 #include "seaf-db.h"
 #include "seaf-utils.h"
+
+#include "log.h"
 
 #define CONNECT_INTERVAL_MSEC 10 * 1000
 
@@ -132,6 +134,10 @@ seafile_session_new(const char *seafile_dir,
     if (!session->listen_mgr)
         goto onerror;
 
+    session->copy_mgr = seaf_copy_manager_new (session);
+    if (!session->copy_mgr)
+        goto onerror;
+
     session->job_mgr = ccnet_job_manager_new (session->sync_thread_pool_size);
     ccnet_session->job_mgr = ccnet_job_manager_new (session->rpc_thread_pool_size);
 
@@ -223,6 +229,11 @@ seafile_session_start (SeafileSession *session)
         return -1;
     }
 
+    if (seaf_copy_manager_start (session->copy_mgr) < 0) {
+        g_error ("Failed to start copy manager.\n");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -249,4 +260,128 @@ load_thread_pool_config (SeafileSession *session)
         session->sync_thread_pool_size = DEFAULT_THREAD_POOL_SIZE;
 
     return 0;
+}
+
+char *
+get_system_default_repo_id (SeafileSession *session)
+{
+    char *sql = "SELECT info_value FROM SystemInfo WHERE info_key='default_repo_id'";
+    return seaf_db_get_string (session->db, sql);
+}
+
+int
+set_system_default_repo_id (SeafileSession *session, const char *repo_id)
+{
+    char sql[256];
+    snprintf (sql, sizeof(sql),
+              "INSERT INTO SystemInfo VALUES ('default_repo_id', '%s')",
+              repo_id);
+    return seaf_db_query (session->db, sql);
+}
+
+#define DEFAULT_TEMPLATE_DIR "library-template"
+
+static void
+copy_template_files_recursive (SeafileSession *session,
+                               const char *repo_id,
+                               const char *repo_dir_path,
+                               const char *dir_path)
+{
+    GDir *dir;
+    const char *name;
+    char *sub_path, *repo_sub_path;
+    SeafStat st;
+    GError *error = NULL;
+    int rc;
+
+    dir = g_dir_open (dir_path, 0, &error);
+    if (!dir) {
+        seaf_warning ("Failed to open template dir %s: %s.\n",
+                      dir_path, error->message);
+        return;
+    }
+
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        sub_path = g_build_filename (dir_path, name, NULL);
+        if (seaf_stat (sub_path, &st) < 0) {
+            seaf_warning ("Failed to stat %s: %s.\n", sub_path, strerror(errno));
+            g_free (sub_path);
+            continue;
+        }
+
+        if (S_ISREG(st.st_mode)) {
+            rc = seaf_repo_manager_post_file (session->repo_mgr,
+                                              repo_id,
+                                              sub_path,
+                                              repo_dir_path,
+                                              name,
+                                              "System",
+                                              NULL);
+            if (rc < 0)
+                seaf_warning ("Failed to add template file %s.\n", sub_path);
+        } else if (S_ISDIR(st.st_mode)) {
+            rc = seaf_repo_manager_post_dir (session->repo_mgr,
+                                             repo_id,
+                                             repo_dir_path,
+                                             name,
+                                             "System",
+                                             NULL);
+            if (rc < 0) {
+                seaf_warning ("Failed to add template dir %s.\n", sub_path);
+                g_free (sub_path);
+                continue;
+            }
+
+            repo_sub_path = g_build_path ("/", repo_dir_path, name, NULL);
+            copy_template_files_recursive (session, repo_id,
+                                           repo_sub_path, sub_path);
+            g_free (repo_sub_path);
+        }
+        g_free (sub_path);
+    }
+}
+
+static void *
+create_system_default_repo (void *data)
+{
+    SeafileSession *session = data;
+    char *repo_id;
+    char *template_path;
+
+    /* If it already exists, don't need to create. */
+    repo_id = get_system_default_repo_id (session);
+    if (repo_id != NULL)
+        return data;
+
+    repo_id = seaf_repo_manager_create_new_repo (session->repo_mgr,
+                                                 "My Library Template",
+                                                 "Template for creating 'My Libray' for users",
+                                                 "System",
+                                                 NULL, NULL);
+    if (!repo_id) {
+        seaf_warning ("Failed to create system default repo.\n");
+        return data;
+    }
+
+    set_system_default_repo_id (session, repo_id);
+
+    template_path = g_build_filename (session->seaf_dir, DEFAULT_TEMPLATE_DIR, NULL);
+    copy_template_files_recursive (session, repo_id, "/", template_path);
+
+    g_free (repo_id);
+    g_free (template_path);
+    return data;
+}
+
+void
+schedule_create_system_default_repo (SeafileSession *session)
+{
+    char *sql = "CREATE TABLE IF NOT EXISTS SystemInfo "
+        "(info_key VARCHAR(256), info_value VARCHAR(1024))";
+    if (seaf_db_query (session->db, sql) < 0)
+        return;
+
+    ccnet_job_manager_schedule_job (session->job_mgr,
+                                    create_system_default_repo,
+                                    NULL, session);
 }

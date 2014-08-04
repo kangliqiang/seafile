@@ -6,64 +6,80 @@
 #include "log.h"
 
 static int
-merge_trees_recursive (int n, SeafDir *trees[],
+merge_trees_recursive (const char *store_id, int version,
+                       int n, SeafDir *trees[],
                        const char *basedir,
                        MergeOptions *opt);
 
 static char *
-merge_conflict_filename (const char *remote_head,
+merge_conflict_filename (const char *store_id, int version,
+                         MergeOptions *opt,
                          const char *basedir,
                          const char *filename)
 {
-    char *path = NULL, *conflict_suffix = NULL, *conflict_name = NULL;
+    char *path = NULL, *modifier = NULL, *conflict_name = NULL;
+    gint64 mtime;
     SeafCommit *commit;
 
     path = g_strconcat (basedir, filename, NULL);
 
-    conflict_suffix = get_last_changer_of_file (remote_head, path);
-    if (!conflict_suffix) {
-        commit = seaf_commit_manager_get_commit (seaf->commit_mgr, remote_head);
+    int rc = get_file_modifier_mtime (opt->remote_repo_id,
+                                      store_id,
+                                      version,
+                                      opt->remote_head,
+                                      path,
+                                      &modifier, &mtime);
+    if (rc < 0) {
+        commit = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                                 opt->remote_repo_id,
+                                                 version,
+                                                 opt->remote_head);
         if (!commit) {
-            seaf_warning ("Failed to find remote head %s.\n", remote_head);
+            seaf_warning ("Failed to find remote head %s.\n", opt->remote_head);
             goto out;
         }
-        conflict_suffix = g_strdup(commit->creator_name);
+        modifier = g_strdup(commit->creator_name);
+        mtime = (gint64)time(NULL);
         seaf_commit_unref (commit);
     }
 
-    conflict_name = gen_conflict_path (filename, conflict_suffix);
+    conflict_name = gen_conflict_path (filename, modifier, mtime);
 
 out:
     g_free (path);
-    g_free (conflict_suffix);
+    g_free (modifier);
     return conflict_name;
 }
 
 static char *
-merge_conflict_dirname (const char *remote_head,
+merge_conflict_dirname (const char *store_id, int version,
+                        MergeOptions *opt,
                         const char *basedir,
                         const char *dirname)
 {
-    char *conflict_suffix = NULL, *conflict_name = NULL;
+    char *modifier = NULL, *conflict_name = NULL;
     SeafCommit *commit;
 
-    commit = seaf_commit_manager_get_commit (seaf->commit_mgr, remote_head);
+    commit = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                             opt->remote_repo_id, version,
+                                             opt->remote_head);
     if (!commit) {
-        seaf_warning ("Failed to find remote head %s.\n", remote_head);
+        seaf_warning ("Failed to find remote head %s.\n", opt->remote_head);
         goto out;
     }
-    conflict_suffix = g_strdup(commit->creator_name);
+    modifier = g_strdup(commit->creator_name);
     seaf_commit_unref (commit);
 
-    conflict_name = gen_conflict_path (dirname, conflict_suffix);
+    conflict_name = gen_conflict_path (dirname, modifier, (gint64)time(NULL));
 
 out:
-    g_free (conflict_suffix);
+    g_free (modifier);
     return conflict_name;
 }
 
 static int
-merge_entries (int n, SeafDirent *dents[],
+merge_entries (const char *store_id, int version,
+               int n, SeafDirent *dents[],
                const char *basedir,
                GList **dents_out,
                MergeOptions *opt)
@@ -114,7 +130,8 @@ merge_entries (int n, SeafDirent *dents[],
 
             seaf_debug ("%s%s: files conflict\n", basedir, head->name);
 
-            conflict_name = merge_conflict_filename(opt->remote_head,
+            conflict_name = merge_conflict_filename(store_id, version,
+                                                    opt,
                                                     basedir,
                                                     head->name);
             if (!conflict_name)
@@ -123,12 +140,14 @@ merge_entries (int n, SeafDirent *dents[],
             /* Change remote entry name in place. So opt->callback
              * will see the conflict name, not the original name.
              */
-            g_strlcpy (remote->name, conflict_name, sizeof(remote->name));
+            g_free (remote->name);
+            remote->name = conflict_name;
             remote->name_len = strlen (remote->name);
-            g_free (conflict_name);
 
             *dents_out = g_list_prepend (*dents_out, seaf_dirent_dup(head));
             *dents_out = g_list_prepend (*dents_out, seaf_dirent_dup(remote));
+
+            opt->conflict = TRUE;
         }
     } else if (base && !head && remote) {
         if (strcmp (base->id, remote->id) != 0) {
@@ -139,7 +158,8 @@ merge_entries (int n, SeafDirent *dents[],
                 seaf_debug ("%s%s: DFC, file -> dir, file\n",
                             basedir, remote->name);
 
-                conflict_name = merge_conflict_filename(opt->remote_head,
+                conflict_name = merge_conflict_filename(store_id, version,
+                                                        opt,
                                                         basedir,
                                                         remote->name);
                 if (!conflict_name)
@@ -147,11 +167,13 @@ merge_entries (int n, SeafDirent *dents[],
 
                 /* Change the name of remote, keep dir name in head unchanged. 
                  */
-                g_strlcpy (remote->name, conflict_name, sizeof(remote->name));
+                g_free (remote->name);
+                remote->name = conflict_name;
                 remote->name_len = strlen (remote->name);
-                g_free (conflict_name);
 
                 *dents_out = g_list_prepend (*dents_out, seaf_dirent_dup(remote));
+
+                opt->conflict = TRUE;
             } else {
                 /* Deleted in head and changed in remote. */
 
@@ -180,17 +202,20 @@ merge_entries (int n, SeafDirent *dents[],
                 /* We use remote head commit author name as conflict
                  * suffix of a dir.
                  */
-                conflict_name = merge_conflict_dirname (opt->remote_head,
+                conflict_name = merge_conflict_dirname (store_id, version,
+                                                        opt,
                                                         basedir, dents[2]->name);
                 if (!conflict_name)
                     return -1;
 
                 /* Change remote dir name to conflict name in place. */
-                g_strlcpy (dents[2]->name, conflict_name, sizeof(dents[2]->name));
+                g_free (dents[2]->name);
+                dents[2]->name = conflict_name;
                 dents[2]->name_len = strlen (dents[2]->name);
-                g_free (conflict_name);
 
                 *dents_out = g_list_prepend (*dents_out, seaf_dirent_dup(head));
+
+                opt->conflict = TRUE;
             } else {
                 /* Deleted in remote and changed in head. */
 
@@ -232,17 +257,20 @@ merge_entries (int n, SeafDirent *dents[],
 
             seaf_debug ("%s%s: DFC, dir -> dir, file\n", basedir, remote->name);
 
-            conflict_name = merge_conflict_filename(opt->remote_head,
+            conflict_name = merge_conflict_filename(store_id, version,
+                                                    opt,
                                                     basedir,
                                                     remote->name);
             if (!conflict_name)
                 return -1;
 
-            g_strlcpy (remote->name, conflict_name, sizeof(remote->name));
+            g_free (remote->name);
+            remote->name = conflict_name;
             remote->name_len = strlen (remote->name);
-            g_free (conflict_name);
 
             *dents_out = g_list_prepend (*dents_out, seaf_dirent_dup(remote));
+
+            opt->conflict = TRUE;
         }
     } else if (!base && head && !remote) {
         if (!dents[2]) {
@@ -269,16 +297,19 @@ merge_entries (int n, SeafDirent *dents[],
 
             seaf_debug ("%s%s: DFC, dir -> file, dir\n", basedir, head->name);
 
-            conflict_name = merge_conflict_dirname (opt->remote_head,
+            conflict_name = merge_conflict_dirname (store_id, version,
+                                                    opt,
                                                     basedir, dents[2]->name);
             if (!conflict_name)
                 return -1;
 
-            g_strlcpy (dents[2]->name, conflict_name, sizeof(dents[2]->name));
+            g_free (dents[2]->name);
+            dents[2]->name = conflict_name;
             dents[2]->name_len = strlen (dents[2]->name);
-            g_free (conflict_name);
 
             *dents_out = g_list_prepend (*dents_out, seaf_dirent_dup(head));
+
+            opt->conflict = TRUE;
         }
     } else if (base && !head && !remote) {
         /* Don't need to add anything to dents_out. */
@@ -289,7 +320,8 @@ merge_entries (int n, SeafDirent *dents[],
 }
 
 static int
-merge_directories (int n, SeafDirent *dents[],
+merge_directories (const char *store_id, int version,
+                   int n, SeafDirent *dents[],
                    const char *basedir,
                    GList **dents_out,
                    MergeOptions *opt)
@@ -376,7 +408,9 @@ merge_directories (int n, SeafDirent *dents[],
     memset (sub_dirs, 0, sizeof(sub_dirs[0])*n);
     for (i = 0; i < n; ++i) {
         if (dents[i] != NULL && S_ISDIR(dents[i]->mode)) {
-            dir = seaf_fs_manager_get_seafdir (seaf->fs_mgr, dents[i]->id);
+            dir = seaf_fs_manager_get_seafdir (seaf->fs_mgr,
+                                               store_id, version,
+                                               dents[i]->id);
             if (!dir) {
                 seaf_warning ("Failed to find dir %s.\n", dents[i]->id);
                 ret = -1;
@@ -391,7 +425,7 @@ merge_directories (int n, SeafDirent *dents[],
 
     new_basedir = g_strconcat (basedir, dirname, "/", NULL);
 
-    ret = merge_trees_recursive (n, sub_dirs, new_basedir, opt);
+    ret = merge_trees_recursive (store_id, version, n, sub_dirs, new_basedir, opt);
 
     g_free (new_basedir);
 
@@ -423,7 +457,8 @@ compare_dirents (gconstpointer a, gconstpointer b)
 }
 
 static int
-merge_trees_recursive (int n, SeafDir *trees[],
+merge_trees_recursive (const char *store_id, int version,
+                       int n, SeafDir *trees[],
                        const char *basedir,
                        MergeOptions *opt)
 {
@@ -485,14 +520,16 @@ merge_trees_recursive (int n, SeafDir *trees[],
 
         /* Merge entries of this level. */
         if (n_files > 0) {
-            ret = merge_entries (n, dents, basedir, &merged_dents, opt);
+            ret = merge_entries (store_id, version,
+                                 n, dents, basedir, &merged_dents, opt);
             if (ret < 0)
                 return ret;
         }
 
         /* Recurse into sub level. */
         if (n_dirs > 0) {
-            ret = merge_directories (n, dents, basedir, &merged_dents, opt);
+            ret = merge_directories (store_id, version,
+                                     n, dents, basedir, &merged_dents, opt);
             if (ret < 0)
                 return ret;
         }
@@ -500,7 +537,8 @@ merge_trees_recursive (int n, SeafDir *trees[],
 
     if (n == 3 && opt->do_merge) {
         merged_dents = g_list_sort (merged_dents, compare_dirents);
-        merged_tree = seaf_dir_new (NULL, merged_dents, 0);
+        merged_tree = seaf_dir_new (NULL, merged_dents,
+                                    dir_version_from_repo_version(version));
 
         memcpy (opt->merged_tree_root, merged_tree->dir_id, 40);
 
@@ -508,7 +546,7 @@ merge_trees_recursive (int n, SeafDir *trees[],
             (trees[2] && strcmp (trees[2]->dir_id, merged_tree->dir_id) == 0)) {
             seaf_dir_free (merged_tree);
         } else {
-            ret = seaf_dir_save (seaf->fs_mgr, merged_tree);
+            ret = seaf_dir_save (seaf->fs_mgr, store_id, version, merged_tree);
             seaf_dir_free (merged_tree);
             if (ret < 0) {
                 seaf_warning ("Failed to save merged tree %s.\n", basedir);
@@ -520,7 +558,8 @@ merge_trees_recursive (int n, SeafDir *trees[],
 }
 
 int
-seaf_merge_trees (int n, const char *roots[], MergeOptions *opt)
+seaf_merge_trees (const char *store_id, int version,
+                  int n, const char *roots[], MergeOptions *opt)
 {
     SeafDir **trees, *root;
     int i, ret;
@@ -529,7 +568,7 @@ seaf_merge_trees (int n, const char *roots[], MergeOptions *opt)
 
     trees = g_new0 (SeafDir *, n);
     for (i = 0; i < n; ++i) {
-        root = seaf_fs_manager_get_seafdir (seaf->fs_mgr, roots[i]);
+        root = seaf_fs_manager_get_seafdir (seaf->fs_mgr, store_id, version, roots[i]);
         if (!root) {
             seaf_warning ("Failed to find dir %s.\n", roots[i]);
             g_free (trees);
@@ -538,7 +577,7 @@ seaf_merge_trees (int n, const char *roots[], MergeOptions *opt)
         trees[i] = root;
     }
 
-    ret = merge_trees_recursive (n, trees, "", opt);
+    ret = merge_trees_recursive (store_id, version, n, trees, "", opt);
 
     for (i = 0; i < n; ++i)
         seaf_dir_free (trees[i]);
